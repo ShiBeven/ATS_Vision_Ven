@@ -1,0 +1,145 @@
+#enemy_color: "red"
+enemy_color: "blue"
+
+#####-----神经网络参数-----#####
+yolo_name: yolov5
+classify_model: assets/tiny_resnet.onnx
+yolo11_model_path: assets/yolo11.xml
+yolov8_model_path: assets/yolov8.xml
+yolov5_model_path: assets/yolov5.xml
+device: CPU
+min_confidence: 0.8
+use_traditional: true
+
+#####-----ROI-----#####
+roi: 
+  x: 420
+  y: 50
+  width: 600
+  height: 600
+
+use_roi: false
+
+#####-----传统方法参数-----#####
+threshold: 150
+max_angle_error: 45 # degree
+min_lightbar_ratio: 1.5
+max_lightbar_ratio: 20
+min_lightbar_length: 8
+min_armor_ratio: 1
+max_armor_ratio: 5
+max_side_ratio: 1.5
+max_rectangular_error: 25 # degree
+
+#####-----tracker参数-----#####
+min_detect_count: 3
+max_temp_lost_count: 15
+
+outpost_max_temp_lost_count: 75
+outpost_radius: 0.2765
+outpost_armor_z_offsets: [0.0, -0.102, 0.102]
+outpost_fixed_center_rotation_model: true
+outpost_spin_speed_lock: 2.51
+outpost_coming_angle: 60
+#决定“提前多早开始认定下一块板是应打板”，主要管选板提前量和轨迹连续性。
+outpost_leaving_angle: 18
+#决定“板进入正面附近后还能保留多久”，同时还间接决定最终 fire 相位窗口大小
+outpost_delay_time: 0.078
+outpost_fire_z_compensation: [0.0, -0.012, 0.0]
+
+#####-----aimer参数----
+yaw_offset: -2.59
+pitch_offset: 1.47
+coming_angle: 55
+leaving_angle: 20
+decision_speed: 8
+high_speed_delay_time: 0.056  # 略微减少高速延迟，进一步提高响应速度 
+low_speed_delay_time: 0.10  # 略微减少低速延迟
+
+#####-----shooter参数-----#####
+first_tolerance: 3 # 近距离射击容差，degree 降低容差提高精度
+second_tolerance: 2 # 远距离射击容差，degree 降低容差提高精度
+judge_distance: 2 #距离判断阈值
+auto_fire: true # 是否由自瞄控制射击
+
+camera_name: "hikrobot"
+exposure_ms: 3.0
+gain: 16.0
+vid_pid: "2bdf:0001"
+
+#  1  0  0
+#  0  1  0
+#  0  0  1
+R_gimbal2imubody: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+
+# 重投影误差: 0.0526px
+camera_matrix: [2367.1339239815302, 0, 721.80933814759874, 0, 2365.2787650707528, 563.7711750297442, 0, 0, 1]
+distort_coeffs: [-0.042601191724392778, 0.056451723004313122, 0.00049245314341547525, -0.00056268402792390736, 0]
+
+# 相机同理想情况的偏角: yaw-2.59 pitch-1.47 roll-0.79 degree
+R_camera2gimbal: [0.045525921103136913, -0.025047876807365244, 0.99864908470150515, -0.99886794846019544, -0.014943114872021157, 0.045161098933064019, 0.013791738346972841, -0.99957456309440196, -0.02569982038855545]
+t_camera2gimbal: [0.051300830384167183, 0.006579271341215295, 0.027529892986049929]
+
+
+#####-----cboard参数-----#####
+quaternion_canid: 0x100
+bullet_speed_canid: 0x101
+send_canid: 0xff
+can_interface: "can0"
+
+#####-----gimbal参数-----
+com_port: "/dev/ttyACM0"
+gimbal_state_unit: "deg"
+# yaw_kp: 0  # 进一步增加yaw轴比例增益，提高响应速度
+# yaw_kd: 0  # 进一步增加yaw轴微分增益，减少剩余震荡
+# pitch_kp: 0  # 进一步增加pitch轴比例增益，原先是0.22
+# pitch_kd: 0  # 进一步增加pitch轴微分增益，原先是0.15
+
+#####-----planner-----#####
+fire_thresh: 0.0027  # 当前设置为0.0035弧度（约0.2度）
+bullet_speed_min: 10.0
+bullet_speed_max: 25.0
+bullet_speed_fallback: 24.0
+
+max_yaw_acc: 90  # 当前设置为60度/秒² serial: SerialException device reports readiness to write but returned no data
+Q_yaw: [3e6, 0.3]  # 当前位置权重为4e6，速度权重为0
+R_yaw: [1.57] # 当前设置为0.7
+max_pitch_acc: 75  # 当前设置为100度/秒²
+Q_pitch: [7e5, 0]  # 当前位置权重为6e6，速度权重为0
+R_pitch: [1.0]  # 当前设置为0.7
+
+#####-----buff_detector参数-----#####
+model: "assets/Rune-v8n-fp16-20260624-D14367-B16.xml"
+buff_confidence_threshold: 0.5    # 三分类最大分阈值
+buff_keypoint_threshold: 0.8      # 单关键点置信度门槛
+buff_min_valid_keypoints: 3       # 达标关键点数下限
+buff_center_dist_threshold: 100   # 中心距离NMS阈值(原图像素)
+
+#####-----buff_aimer参数-----#####
+fire_gap_time: 0.700   # s
+predict_time: 0     # s 微调预测时间，可能需要根据实际情况调整
+buff_predict_lead_scale: 0  # 瞄准提前量缩放(1.0=原行为; 蓝框超前过多调小; 0=无提前)
+# MPC速度/加速度前馈。验证识别层时置false只跑位置环，避免前馈的已知缺陷混淆归因
+buff_mpc_feedforward: false
+# 绿框沿 R 轴圆周方向的人工微调(与 yaw/pitch_offset 的直接平移补偿正交)。
+# R_len: 缩放绿框底点(叶心)到 R 标的距离, 1.0=不缩放; >1 更远(离心), <1 更近。
+# C_len: 圆周方向弧长偏移, 单位 m; 正=沿转向(roll 增大方向)超前, 负=滞后。0=不偏移。
+# 两参数同时作用于绿框重投影、蓝框(预测)与实际瞄准点, 三者联动。
+R_len: 0.98
+C_len: 0.0
+
+#####-----web_debugger参数-----#####
+show_local: false
+disable_web: false
+web_host: "0.0.0.0"
+web_port: 8090
+web_fps: 30.0
+web_scale: 0.8
+web_jpeg_quality: 55
+web_client_ttl_ms: 1000
+
+#####-----debug_record参数-----#####
+record_raw_video: false
+record_debug_video: false
+record_debug_fps: 30.0
+record_debug_dir: "records"

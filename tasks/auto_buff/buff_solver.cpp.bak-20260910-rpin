@@ -1,0 +1,362 @@
+#include "buff_solver.hpp"
+
+#include <cmath>
+#include <limits>
+
+#include "tools/logger.hpp"
+#include "tools/path.hpp"
+#include "tools/runtime_params.hpp"
+#include "tools/yaml.hpp"
+namespace auto_buff
+{
+namespace
+{
+// ---- R 标进 PnP 前的几何门 ----
+//
+// 全部按 |上-下| 这条 254 mm 基线归一, 与目标距离、图像尺度无关。
+//   沿轴位置 t/L = (573 - z_R) / 254   → z_R = 0 时 2.256, z_R = 220 mm 时 1.390
+//   门开在 [1.2, 3.2] 对应 z_R ∈ [-240 mm, +268 mm] —— 只挡明显离谱的 R,
+//   不去裁决"220 还是 0"这种量级的分歧(那个由仪表量, 不由门判)。
+//   横向偏移 0.40 * L ≈ 102 mm: R 标必须落在这条径向线的延长线上。
+constexpr double R_GATE_MIN_ALONG = 1.2;
+constexpr double R_GATE_MAX_ALONG = 3.2;
+constexpr double R_GATE_MAX_PERP = 0.40;
+constexpr double R_GATE_MIN_BASELINE_PX = 5.0;
+
+void load_buff_solver_calibration(
+  const std::string & config_path, Eigen::Matrix3d & R_gimbal2imubody,
+  Eigen::Matrix3d & R_camera2gimbal, Eigen::Vector3d & t_camera2gimbal, cv::Mat & camera_matrix,
+  cv::Mat & distort_coeffs)
+{
+  if (tools::runtime_params::is_registered(config_path)) {
+    const auto R_gimbal2imubody_data =
+      tools::runtime_params::get_number_array(config_path, "R_gimbal2imubody");
+    const auto R_camera2gimbal_data =
+      tools::runtime_params::get_number_array(config_path, "R_camera2gimbal");
+    const auto t_camera2gimbal_data =
+      tools::runtime_params::get_number_array(config_path, "t_camera2gimbal");
+    const auto camera_matrix_data =
+      tools::runtime_params::get_number_array(config_path, "camera_matrix");
+    const auto distort_coeffs_data =
+      tools::runtime_params::get_number_array(config_path, "distort_coeffs");
+
+    R_gimbal2imubody =
+      Eigen::Matrix<double, 3, 3, Eigen::RowMajor>(R_gimbal2imubody_data.data());
+    R_camera2gimbal =
+      Eigen::Matrix<double, 3, 3, Eigen::RowMajor>(R_camera2gimbal_data.data());
+    t_camera2gimbal = Eigen::Matrix<double, 3, 1>(t_camera2gimbal_data.data());
+
+    const Eigen::Matrix<double, 3, 3, Eigen::RowMajor> camera_matrix_eigen(camera_matrix_data.data());
+    const Eigen::Matrix<double, 1, 5> distort_coeffs_eigen(distort_coeffs_data.data());
+    cv::eigen2cv(camera_matrix_eigen, camera_matrix);
+    cv::eigen2cv(distort_coeffs_eigen, distort_coeffs);
+    return;
+  }
+
+  auto yaml = tools::load(config_path);
+
+  auto R_gimbal2imubody_data = yaml["R_gimbal2imubody"].as<std::vector<double>>();
+  auto R_camera2gimbal_data = yaml["R_camera2gimbal"].as<std::vector<double>>();
+  auto t_camera2gimbal_data = yaml["t_camera2gimbal"].as<std::vector<double>>();
+  R_gimbal2imubody =
+    Eigen::Matrix<double, 3, 3, Eigen::RowMajor>(R_gimbal2imubody_data.data());
+  R_camera2gimbal = Eigen::Matrix<double, 3, 3, Eigen::RowMajor>(R_camera2gimbal_data.data());
+  t_camera2gimbal = Eigen::Matrix<double, 3, 1>(t_camera2gimbal_data.data());
+
+  auto camera_matrix_data = yaml["camera_matrix"].as<std::vector<double>>();
+  auto distort_coeffs_data = yaml["distort_coeffs"].as<std::vector<double>>();
+  const Eigen::Matrix<double, 3, 3, Eigen::RowMajor> camera_matrix_eigen(camera_matrix_data.data());
+  const Eigen::Matrix<double, 1, 5> distort_coeffs_eigen(distort_coeffs_data.data());
+  cv::eigen2cv(camera_matrix_eigen, camera_matrix);
+  cv::eigen2cv(distort_coeffs_eigen, distort_coeffs);
+}
+}  // namespace
+
+cv::Matx33f Solver::rotation_matrix(double angle) const
+{
+  return cv::Matx33f(
+    1, 0, 0, 0, std::cos(angle), -std::sin(angle), 0, std::sin(angle), std::cos(angle));
+}
+
+void Solver::compute_rotated_points(std::vector<std::vector<cv::Point3f>> & object_points)
+{
+  const std::vector<cv::Point3f> & base_points = object_points[0];
+  for (int i = 1; i < 5; ++i) {
+    double angle = i * THETA;
+    cv::Matx33f R = rotation_matrix(angle);
+    std::vector<cv::Point3f> rotated_points;
+    for (const auto & point : base_points) {
+      cv::Vec3f vec(point.x, point.y, point.z);
+      cv::Vec3f rotated_vec = R * vec;
+      rotated_points.emplace_back(rotated_vec[0], rotated_vec[1], rotated_vec[2]);
+    }
+    object_points[i] = rotated_points;
+  }
+}
+
+Solver::Solver(const std::string & config_path)
+: config_path_(tools::resolve_config_path_string(config_path)),
+  R_gimbal2world_(Eigen::Matrix3d::Identity())
+{
+  load_buff_solver_calibration(
+    config_path_, R_gimbal2imubody_, R_camera2gimbal_, t_camera2gimbal_, camera_matrix_,
+    distort_coeffs_);
+  runtime_params_version_ = tools::runtime_params::version(config_path_);
+
+  // compute_rotated_points(OBJECT_POINTS);
+}
+
+void Solver::refresh_runtime_params_if_needed()
+{
+  const auto current_version = tools::runtime_params::version(config_path_);
+  if (current_version == 0 || current_version == runtime_params_version_) return;
+
+  load_buff_solver_calibration(
+    config_path_, R_gimbal2imubody_, R_camera2gimbal_, t_camera2gimbal_, camera_matrix_,
+    distort_coeffs_);
+  runtime_params_version_ = current_version;
+  tools::logger()->info("[BuffSolver] runtime params updated to v{}", current_version);
+}
+
+Eigen::Matrix3d Solver::R_gimbal2world() const { return R_gimbal2world_; }
+
+void Solver::set_R_gimbal2world(const Eigen::Quaterniond & q)
+{
+  Eigen::Matrix3d R_imubody2imuabs = q.toRotationMatrix();
+  R_gimbal2world_ = R_gimbal2imubody_.transpose() * R_imubody2imuabs * R_gimbal2imubody_;
+}
+
+void Solver::solve(std::optional<PowerRune> & ps) const
+{
+  const_cast<Solver *>(this)->refresh_runtime_params_if_needed();
+  if (!ps.has_value()) return;
+  PowerRune & p = ps.value();
+  // std::vector<cv::Point2f> image_points;
+  // std::vector<cv::Point3f> object_points;
+  // int i = 0;
+  // for (auto & fanblade : p.fanblades) {
+  //   if (fanblade.type != _unlight) {
+  //     image_points.insert(image_points.end(), fanblade.points.begin(), fanblade.points.end());
+  //     image_points.emplace_back(fanblade.center);
+  //     object_points.insert(object_points.end(), OBJECT_POINTS[i].begin(), OBJECT_POINTS[i].end());
+  //   }
+  //   ++i;
+  // }
+  // image_points.emplace_back(p.r_center);  //r_center
+  // object_points.emplace_back(cv::Point3f(0, 0, 0));
+  // ================= 送进 PnP 的点集: 4 个角点 + R 标 =================
+  //
+  // 【为什么要改】原先这里把 p.r_center 塞进 image_points, 紧接着又用
+  // begin()+4 把它切掉 —— R 标那一行是死代码, PnP 实际只看 4 个角点。
+  // 那 4 点在符平面里只张 254 mm(上下 827/573, 左右 ±127), 在 8.57 m 处约 1.7°,
+  // 而 tvec_ 是这个位姿往 700 mm 外的转轴**外推**出来的。角度上的亚像素噪声
+  // 到杠杆末端被放大成几十像素, 于是:
+  //   - buff_R_dis 在 [8.06, 9.33] m 里晃, 跨轮次漂 6%(检测层输出却逐位相同);
+  //   - 画面上"叶心→转轴"那条线的末端离检测到的 R 十字乱飞。
+  //
+  // R 标本身就在转轴上, 是全图最稳的地标。把它配进点集:
+  //   - 基线从 254 mm 拉到 ~700 mm, 转轴位置从"外推"变成"实测";
+  //   - 4 点 8 方程 6 未知的**恰定**问题变成 10 方程 6 未知的**超定**问题,
+  //     重投影残差从此有鉴别力(原先 RMS 恒 0.17 px 是恰定的必然结果, 不是位姿对);
+  //   - 共面性没变(7 个物体点 x 恒为 0), IPPE 两解的二义性依旧存在,
+  //     所以下面按时序挑解那段必须保留。
+  //
+  // 【为什么不把叶心 p.target().center 也配进去】它在检测器里就是
+  // (kpt[0]+kpt[1]+kpt[3]+kpt[4]) / 4, 即那 4 个角点的均值 —— 线性相关, 不带新信息,
+  // 只会给 4 个角点重新加权。所以维持注释状态。
+  //
+  // 【为什么 R 标要先过一道几何门】检测器的入选门槛是 min_valid_keypoints=3,
+  // R 那个关键点置信度低于 kpt_threshold 时整个候选仍可能入选, 此时 obj.r 是无依据的猜测。
+  // 让 PnP 依赖一个可能是垃圾的点比不用它更糟, 所以先在**纯 2D、不需要位姿**的意义下
+  // 检查 R 是否落在合理位置: 沿"上→下"方向的位置比、以及到这条径向线的横向偏移。
+  // 这两个量只用到**方向**信息(254 mm 基线定方向精度约 1°), 不含病态的深度外推 ——
+  // 所以门能判 R 标, 而 4 点位姿判不了 R 标。
+  const auto & kpt = p.target().points;
+  if (kpt.size() < 4) {
+    tools::logger()->debug("[BuffSolver] 角点不足 4 个, 跳过本帧位姿解算");
+    return;
+  }
+
+  std::vector<cv::Point2f> image_points(kpt.begin(), kpt.begin() + 4);
+  std::vector<cv::Point3f> object_points(OBJECT_POINTS.begin(), OBJECT_POINTS.begin() + 4);
+
+  last_solve_used_r_ = false;
+  const cv::Point2f axis = image_points[2] - image_points[0];  // 上 → 下, 指向转轴
+  const double baseline = cv::norm(axis);
+  if (baseline > R_GATE_MIN_BASELINE_PX) {
+    const cv::Point2f u = axis / static_cast<float>(baseline);  // 单位方向
+    const cv::Point2f w = p.r_center - image_points[2];         // 下 → R
+    const double t_along = (w.x * u.x + w.y * u.y) / baseline;  // 以 baseline 为单位
+    const double d_perp = std::abs(w.x * u.y - w.y * u.x) / baseline;
+    if (
+      d_perp < R_GATE_MAX_PERP && t_along > R_GATE_MIN_ALONG && t_along < R_GATE_MAX_ALONG) {
+      image_points.push_back(p.r_center);
+      object_points.push_back(OBJECT_POINTS[R_OBJECT_INDEX]);
+      last_solve_used_r_ = true;
+    }
+  }
+  if (!last_solve_used_r_) r_gate_reject_count_++;
+
+  // ---- IPPE 平面二义性的消解 ----
+  //
+  // OBJECT_POINTS 全部 7 点 x 恒为 0, 即目标点集完全共面。共面点集的 PnP 有两个解:
+  // 真实位姿, 以及它关于"相机光心-目标平面"镜像翻折的那个。两解的重投影残差几乎相同
+  // (实测 RMS 0.17 px), 所以重投影误差无法区分。
+  //
+  // 注意区分两件事, 别把上面那段"R 标进 PnP"读成能消二义性:
+  //   - **二义性**来自共面, 加多少个共面点都消不掉 → 只能靠时序挑解(下面这段);
+  //   - **病态**来自 254 mm 基线太短, 加 R 标把基线拉到 700 mm 能改善 → 上面那段。
+  // 两个问题独立, 两个修法都要留着。
+  //
+  // 原先 solvePnP(SOLVEPNP_IPPE) 只返回其中一个解, 挑哪个由 OpenCV 内部按重投影误差决定。
+  // 两解误差近乎相等时, 这个选择在帧间会随亚像素噪声反复横跳, 表现为 yaw/pitch 成对变号
+  // (实测 800 帧里 151 次, 约 23%)。翻转会连带污染同一个 R_buff2world 分解出的 roll,
+  // 而 EKF 的 spd 状态又会把 roll 的方向性残差吸收成转速偏置 —— 这是故障 3 的上游。
+  //
+  // 解法: 用 solvePnPGeneric 拿到全部候选解, 再按"与上一帧姿态最接近"挑。
+  // 实测这段录像的表观旋转是 2.4°/帧(步骤 17), 而两个 IPPE 解相差通常几十度,
+  // 仍差一个数量级, 时序连续性足以区分。
+  std::vector<cv::Mat> rvecs, tvecs;
+  const int n_sol = cv::solvePnPGeneric(
+    object_points, image_points, camera_matrix_, distort_coeffs_, rvecs, tvecs, false,
+    cv::SOLVEPNP_IPPE);
+
+  if (n_sol < 1) {
+    // 解不出来时保留上一帧的 rvec_/tvec_, 让上层按既有逻辑处理
+    tools::logger()->debug("[BuffSolver] solvePnPGeneric 无解, 沿用上一帧位姿");
+    return;
+  }
+
+  int best = 0;
+  if (n_sol > 1 && has_last_pose_) {
+    // 挑与上一帧旋转差最小的解。用旋转向量夹角度量: R_delta = R_last^T * R_cand,
+    // 取其 Rodrigues 模长即两姿态间的最小转角。
+    double best_diff = std::numeric_limits<double>::max();
+    cv::Mat R_last;
+    cv::Rodrigues(last_rvec_, R_last);
+    for (int i = 0; i < n_sol; i++) {
+      cv::Mat R_cand;
+      cv::Rodrigues(rvecs[i], R_cand);
+      cv::Mat R_delta = R_last.t() * R_cand;
+      cv::Mat r_delta;
+      cv::Rodrigues(R_delta, r_delta);
+      const double diff = cv::norm(r_delta);  // 弧度
+      if (diff < best_diff) {
+        best_diff = diff;
+        best = i;
+      }
+    }
+  }
+
+  cv::Mat rvec_best = rvecs[best].clone(), tvec_best = tvecs[best].clone();
+
+  // ---- 只在用了 R 标的路径上做一次 LM 精化 ----
+  //
+  // IPPE 求的是"物体平面 → 像面"单应的代数最优解, 不是几何重投影残差的最小二乘解。
+  // 4 点时两者等价(恰定, 残差都能压到 0), 5 点超定时就不等价了 —— 而"让 R 标真正
+  // 钉住转轴"要的正是几何残差最小。所以这里补一次 LM。
+  //
+  // 【为什么只在 used_r 时做】4 点回退路径必须与改动前逐位相同, 否则丢掉对照基准:
+  // 那条路径上 R 标被几何门判为不可信, 本轮的所有基线数字都来自它。
+  if (last_solve_used_r_) {
+    cv::solvePnPRefineLM(
+      object_points, image_points, camera_matrix_, distort_coeffs_, rvec_best, tvec_best);
+  }
+
+  rvec_ = cv::Vec3d(rvec_best);
+  tvec_ = cv::Vec3d(tvec_best);
+  last_rvec_ = rvec_;
+  has_last_pose_ = true;
+
+  Eigen::Vector3d t_buff2camera;
+  cv::cv2eigen(tvec_, t_buff2camera);
+  cv::Mat rmat;
+  cv::Rodrigues(rvec_, rmat);
+  Eigen::Matrix3d R_buff2camera;
+  cv::cv2eigen(rmat, R_buff2camera);
+
+  Eigen::Vector3d blade_xyz_in_buff{{0, 0, 700e-3}};
+
+  // buff -> camera
+  Eigen::Vector3d xyz_in_camera = t_buff2camera;
+  Eigen::Vector3d blade_xyz_in_camera = R_buff2camera * blade_xyz_in_buff + t_buff2camera;
+
+  // camera -> gimbal
+  Eigen::Matrix3d R_buff2gimbal = R_camera2gimbal_ * R_buff2camera;
+  Eigen::Vector3d xyz_in_gimbal = R_camera2gimbal_ * xyz_in_camera + t_camera2gimbal_;
+  Eigen::Vector3d blade_xyz_in_gimbal = R_camera2gimbal_ * blade_xyz_in_camera + t_camera2gimbal_;
+
+  /// gimbal -> world
+  Eigen::Matrix3d R_buff2world = R_gimbal2world_ * R_buff2gimbal;
+
+  p.xyz_in_world = R_gimbal2world_ * xyz_in_gimbal;
+  p.ypd_in_world = tools::xyz2ypd(p.xyz_in_world);
+
+  p.blade_xyz_in_world = R_gimbal2world_ * blade_xyz_in_gimbal;
+  p.blade_ypd_in_world = tools::xyz2ypd(p.blade_xyz_in_world);
+
+  p.ypr_in_world = tools::eulers(R_buff2world, 2, 1, 0);
+}
+
+// 调试用
+cv::Point2f Solver::point_buff2pixel(cv::Point3f x)
+{
+  refresh_runtime_params_if_needed();
+  // buff坐标系(单位:m)到像素坐标系
+  std::vector<cv::Point3d> world_points;
+  std::vector<cv::Point2d> image_points;
+  world_points.push_back(x);
+  cv::projectPoints(world_points, rvec_, tvec_, camera_matrix_, distort_coeffs_, image_points);
+  return image_points.back();
+}
+
+double Solver::reprojection_error(const std::vector<cv::Point2f> & image_points)
+{
+  refresh_runtime_params_if_needed();
+  // 只比 4 个角点 —— 调用方手里就是这 4 个观测点。
+  // solve() 现在送 5 点(4 角 + R 标), 问题从恰定变超定, 所以这个残差**开始有意义了**:
+  // 4 个角点的残差不再被强制压到 0。但仍不要单独拿它判姿态对错, 因为 R 标的残差
+  // 不在这里面 —— 那一项由 tests/auto_buff_test.cpp 的「R 标重投影」仪表单独量。
+  constexpr size_t N = 4;
+  if (image_points.size() < N || OBJECT_POINTS.size() < N) return -1.0;
+
+  std::vector<cv::Point3f> object_points(OBJECT_POINTS.begin(), OBJECT_POINTS.begin() + N);
+  std::vector<cv::Point2f> projected;
+  cv::projectPoints(object_points, rvec_, tvec_, camera_matrix_, distort_coeffs_, projected);
+
+  double sum_sq = 0.0;
+  for (size_t i = 0; i < N; i++) {
+    const auto d = projected[i] - image_points[i];
+    sum_sq += d.x * d.x + d.y * d.y;
+  }
+  return std::sqrt(sum_sq / N);
+}
+
+// xyz_in_world2xyz_in_pix
+std::vector<cv::Point2f> Solver::reproject_buff(
+  const Eigen::Vector3d & xyz_in_world, double yaw, double row) const
+{
+  const_cast<Solver *>(this)->refresh_runtime_params_if_needed();
+  auto R_buff2world = tools::rotation_matrix(Eigen::Vector3d(yaw, 0.0, row));
+  // clang-format on
+
+  // get R_buff2camera t_buff2camera
+  const Eigen::Vector3d & t_buff2world = xyz_in_world;
+  Eigen::Matrix3d R_buff2camera =
+    R_camera2gimbal_.transpose() * R_gimbal2world_.transpose() * R_buff2world;
+  Eigen::Vector3d t_buff2camera =
+    R_camera2gimbal_.transpose() * (R_gimbal2world_.transpose() * t_buff2world - t_camera2gimbal_);
+
+  // get rvec tvec
+  cv::Vec3d rvec;
+  cv::Mat R_buff2camera_cv;
+  cv::eigen2cv(R_buff2camera, R_buff2camera_cv);
+  cv::Rodrigues(R_buff2camera_cv, rvec);
+  cv::Vec3d tvec(t_buff2camera[0], t_buff2camera[1], t_buff2camera[2]);
+
+  // reproject
+  std::vector<cv::Point2f> image_points;
+  cv::projectPoints(OBJECT_POINTS, rvec, tvec, camera_matrix_, distort_coeffs_, image_points);
+  return image_points;
+}
+}  // namespace auto_buff
