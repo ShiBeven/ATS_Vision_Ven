@@ -336,6 +336,38 @@ void Solver::solve(std::optional<PowerRune> & ps) const
   p.blade_ypd_in_world = tools::xyz2ypd(p.blade_xyz_in_world);
 
   p.ypr_in_world = tools::eulers(R_buff2world, 2, 1, 0);
+
+  /// 几何相位（第七轮）：绕开欧拉分解，直接用旋转矩阵列向量与世界竖直向量计算叶片相位。
+  ///
+  /// 背景: 上面这行欧拉分解在 IPPE 双解翻转时, yaw/pitch 成对跳变会泄漏进 roll 分量,
+  /// 表现为 raw_roll 隔帧差出 -132~-312 deg/s 的物理不可能转速（大符实际恒为正、
+  /// 上限约 120 deg/s）。2026-09-13 18:32 日志已多次复现。
+  ///
+  /// 定义: R_buff2world = Rz(yaw)·Rx(roll)（与 Target::point_buff2world 的
+  /// rotation_matrix(yaw, 0, roll) 一致）。取
+  ///   col0 = R_buff2world 第 0 列  —— 转轴/叶面法向, 只含 yaw, 不受 roll 影响
+  ///   col2 = R_buff2world 第 2 列  —— 叶心方向, 相位项只含 roll
+  ///   ê   = 世界竖直 (0,0,1) 在旋转平面内的投影（减去沿 col0 分量后归一化）
+  /// 则相位
+  ///   phase = atan2( (col0 × ê)·col2 , ê·col2 )
+  /// 已手推验证与 tools::eulers(R,2,1,0)[2] 数学等价, 但无奇异性, 且 IPPE 翻转时
+  /// yaw 项在 col0 中被消去, 不污染相位。
+  ///
+  /// 数值上 col2 与 (blade_xyz_in_world - xyz_in_world).normalized() 等价, 这里直接
+  /// 用矩阵列, 避免引入叶心位置求解噪声。
+  {
+    const Eigen::Vector3d col0 = R_buff2world.col(0);
+    const Eigen::Vector3d col2 = R_buff2world.col(2);
+    const Eigen::Vector3d up(0.0, 0.0, 1.0);
+    Eigen::Vector3d e_hat = up - col0 * up.dot(col0);  // 竖直方向投影到旋转平面
+    if (e_hat.norm() > 1e-9) {
+      e_hat.normalize();
+      p.blade_phase = std::atan2(col0.cross(e_hat).dot(col2), e_hat.dot(col2));
+    } else {
+      // 相机接近正对转轴时旋转平面近似与竖直方向垂直, 投影退化, 退回欧拉 roll 兜底
+      p.blade_phase = p.ypr_in_world[2];
+    }
+  }
 }
 
 // 调试用

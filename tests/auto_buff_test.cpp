@@ -7,12 +7,14 @@
 // 单位四元数，即把云台系当世界系。此时 R_dis / angle / spd 这些量的内部一致性
 // 判据依然成立（判据 1/2/3/4），只有涉及真实云台朝向的判据 6 失去意义。
 
+#include <deque>  // 第十五轮: 切板取证环形缓冲
 #include <fmt/core.h>
 #include <fmt/format.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <fstream>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -63,6 +65,25 @@ struct RunStats
   // EKF 输出
   double spd_sum = 0, spd_sq_sum = 0, spd_min = 1e9, spd_max = -1e9;
   int spd_n = 0;
+  void add_dis(double d)
+  {
+    dis_sum += d;
+    dis_sq_sum += d * d;
+    dis_min = std::min(dis_min, d);
+    dis_max = std::max(dis_max, d);
+    dis_n++;
+  }
+
+  void add_spd(double s)
+  {
+    spd_sum += s;
+    spd_sq_sum += s * s;
+    spd_min = std::min(spd_min, s);
+    spd_max = std::max(spd_max, s);
+    spd_n++;
+  }
+
+
   int angle_step_count = 0;   // |Δangle| 超过半个扇叶间距(36°)的帧数 = 疑似换叶/跳变
   double angle_rate_abs_max = 0;
   int yaw_pitch_flip = 0;     // buff_yaw 与 buff_pitch 同帧成对变号的次数
@@ -150,16 +171,54 @@ struct RunStats
   int r_gate_fail = 0;            // 几何门判 R不可信、退回 4 点 PnP 的帧数
   std::vector<double> pre_r_err;  // 蓝线(预测)轴端离 R 十字的距离, px
 
-  // ---- 绿蓝夹角仪表: 共速判据 ----
-  // 蓝框角 = 绿框角 + spd×T, 两侧求导: 蓝框角速度 = 绿框角速度 + d(spd)/dt×T。
-  // 绿蓝恒共速 ⟺ 夹角恒定。夹角突变 = spd 被冲击(典型: 切板帧叶位跳变残差
-  // 经 P 的 roll-spd 互协方差灌进 spd)。记录逐帧夹角 + 突变帧明细。
-  std::vector<double> gb_angle;       // 蓝相对绿的领先角, deg, 有符号
-  std::vector<double> green_lag;      // 观测相对绿的滞后角, deg (绿框跟得好不好)
-  int gb_angle_jump = 0;              // 帧间夹角变化 > 5° 的次数
-  double gb_angle_jump_max = 0;       // 最大单帧夹角变化, deg
   std::vector<double> pnp_r_err;  // px
   std::vector<double> ekf_r_err;  // px
+
+  // ---- 第二十轮: 绿框漂移分量分解(大符绿框右下漂移定位) ----
+  // 画面现象: 绿框相对检测叶偏右下 60~90px。这个偏移必须先分解到状态分量才能定位:
+  //   green_dr  px    绿框叶心点与检测叶心(700mm 点, 由 PnP 投影)的欧氏距离
+  //   green_droll  deg 绿框叶心相对检测叶心绕 R 的角度差(有符号, 限 ±180°)
+  //   green_dradius px 绿框叶心相对检测叶心的径向长度差(|green|-|obs|, 有符号)
+  //   green_dpos  px   绿框叶心与检测叶心在图像 x/y 方向的位置差(有符号)
+  //   green_yaw_state  deg  EKF x[4] 与 PnP ypr[0] 的差 —— 叶面法向偏航误差
+  //   green_R_axis_err  px  绿框轴端(image_points[6])与检测 R 标的距离 —— 转轴状态误差
+  std::vector<double> green_dr;      // px, 有符号
+  std::vector<double> green_droll;   // deg, 有符号
+  std::vector<double> green_dradius; // px, 有符号
+  std::vector<double> green_dx;      // px, 有符号
+  std::vector<double> green_dy;      // px, 有符号
+  std::vector<double> green_yaw_state;  // deg, 有符号
+  std::vector<double> green_R_axis_err; // px
+  // ---- 第二十二轮: 最差帧定位(找出大误差发生在哪些帧段) ----
+  // med 已收敛但 mean|.|/max 大 → 误差集中在少数帧段。记录每帧元数据,
+  // 结尾输出 |d| 最大的帧及其分量, 与切板事件日志按帧号对齐。
+  std::vector<int> green_frame;
+  std::vector<double> green_time;
+  std::vector<double> green_phase;
+  // 解算路径: 1=used_r(R标5点+LM), 2=4点回退
+  std::vector<int> green_solve_path;
+  void add_green_drift(
+    double dr_deg, double dradius_px, double dx_px, double dy_px, double yaw_diff_deg,
+    double axis_err_px, int frame, double time, double phase, int solve_path)
+  {
+    green_dr.push_back(std::hypot(dx_px, dy_px));
+    green_droll.push_back(dr_deg);
+    green_dradius.push_back(dradius_px);
+    green_dx.push_back(dx_px);
+    green_dy.push_back(dy_px);
+    green_yaw_state.push_back(yaw_diff_deg);
+    green_R_axis_err.push_back(axis_err_px);
+    green_frame.push_back(frame);
+    green_time.push_back(time);
+    green_phase.push_back(phase);
+    green_solve_path.push_back(solve_path);
+  }
+
+  // ---- 环带门仪表(2026-09-13, 大符臂灯杂点) ----
+  std::vector<double> cand_radius_ratios;  // 候选中心 r/baseline
+  std::vector<double> kpt_radius_ratios;    // 四角点 r/baseline
+  int ring_cand_reject_total = 0;
+  int ring_kpt_reject_total = 0;
 
   // ---- EKF 那 134 px 的分量分解: 偏差落在哪个状态上 ----
   //
@@ -201,125 +260,73 @@ struct RunStats
   int center_jump_abnormal = 0;
   int activation_events = 0;  // 已激活候选数增加的次数(5 片叶, 正常不超过 4~5 次)
 
-  static double median_of(std::vector<double> v)
-  {
-    if (v.empty()) return 0.0;
-    const size_t mid = v.size() / 2;
-    std::nth_element(v.begin(), v.begin() + mid, v.end());
-    return v[mid];
-  }
-
-  static double mean_of(const std::vector<double> & v)
-  {
-    if (v.empty()) return 0.0;
-    double s = 0;
-    for (const double x : v) s += x;
-    return s / v.size();
-  }
-
-  static double max_of(const std::vector<double> & v)
-  {
-    if (v.empty()) return 0.0;
-    return *std::max_element(v.begin(), v.end());
-  }
-
-  // 有符号序列用: median 看系统偏置(正负会互相抵消, 正是想要的),
-  // max|·| 看最坏一帧。两个一起才分得开"持续偏一边"和"偶发乱飞"。
-  static double max_abs_of(const std::vector<double> & v)
-  {
-    double m = 0.0;
-    for (const double x : v) m = std::max(m, std::abs(x));
-    return m;
-  }
-
-  // 【为什么非要有这一个】只有 median 和 max|·| 时, 这组数字会骗人, 而且骗过一次了:
-  // 上一轮读到 d_R_yaw median -0.07°、d_R_pitch median -0.69°(合 0.7° = 29 px),
-  // 而同一批帧的 ekf_r_err median 是 117 px, 于是我判"状态是对的, 误差在画图路径",
-  // 去翻了 point_buff2world / reproject_buff —— 那两处是对的, 方向错了。
-  // 实际是: median 量的是**偏置**, 偏置确实被 R1 消掉了; 留下的是 ±2~3° 的**量级**,
-  // 而 median(有符号) 对量级完全不敏感。旁证: 各窗口 d_R_pitch 的 median 在
-  // +1.07/-1.23/-2.32/-0.09/-0.69 之间来回摆, 分布本来就宽。
-  // 判读时认这一条: median|·| × 41.3 px/° 才是该和 ekf_r_err 的 median 对上的数。
-  static double median_abs_of(std::vector<double> v)
-  {
-    for (double & x : v) x = std::abs(x);
-    return median_of(v);
-  }
-
-  void add_dis(double d)
-  {
-    dis_sum += d;
-    dis_sq_sum += d * d;
-    dis_min = std::min(dis_min, d);
-    dis_max = std::max(dis_max, d);
-    dis_n++;
-  }
-
-  void add_spd(double s)
-  {
-    spd_sum += s;
-    spd_sq_sum += s * s;
-    spd_min = std::min(spd_min, s);
-    spd_max = std::max(spd_max, s);
-    spd_n++;
-  }
-
-  static double stddev(double sum, double sq_sum, int n)
-  {
-    if (n < 2) return 0.0;
-    const double mean = sum / n;
-    return std::sqrt(std::max(0.0, sq_sum / n - mean * mean));
-  }
-
-  // 2026-09-10 精简: 诊断期仪表(故障 1-4 已全部定案)只保留核心指标。
-  // 完整诊断版见 .bak-20260910-quiet; 各仪表的判读依据见 buff_model 文档。
-  void print(const char * tag) const
-  {
-    tools::logger()->info("========== {} ==========", tag);
-    tools::logger()->info(
-      "帧数 {} | 有检测 {} ({:.1f}%) | EKF 已解 {} ({:.1f}%) | 解后丢失/发散 {}", frames, detected,
-      frames ? 100.0 * detected / frames : 0.0, solved, frames ? 100.0 * solved / frames : 0.0,
-      lost_after_solved);
-
-    if (spd_n)
-      tools::logger()->info(
-        "EKF spd: mean {:.2f} deg/s, std {:.2f}, [{:.2f}, {:.2f}]", spd_sum / spd_n * 57.3,
-        stddev(spd_sum, spd_sq_sum, spd_n) * 57.3, spd_min * 57.3, spd_max * 57.3);
-
-    tools::logger()->info(
-      "angle 跳变(>36°)帧数: {} | yaw&pitch 成对变号: {}", angle_step_count, yaw_pitch_flip);
-
-    // 用户判据: 绿/蓝线轴端离 R 十字。全 0 = 锁定生效。
-    if (!ekf_r_err.empty())
-      tools::logger()->info(
-        "轴端离 R 十字: EKF median {:.1f} px | 预测 median {:.1f} px (n={})",
-        median_of(ekf_r_err), median_of(pre_r_err), ekf_r_err.size());
-
-    // 绿蓝共速判据: 夹角(蓝领先绿的角)恒定 ⟺ 共速。
-    // 正常应为 spd×T 的稳定值(60°/s×0.57s≈34°); 切板帧突变 = spd 被冲击。
-    if (!gb_angle.empty()) {
-      double gb_mean = 0;
-      for (double v : gb_angle) gb_mean += v;
-      gb_mean /= gb_angle.size();
-      tools::logger()->info(
-        "绿蓝夹角: median {:+.1f}°, mean {:+.1f}° | 突变(>5°/帧) {} 次, 最大 Δ{:.1f}° | "
-        "绿滞后 median {:+.1f}° (n={})",
-        median_of(gb_angle), gb_mean, gb_angle_jump, gb_angle_jump_max,
-        median_of(green_lag), gb_angle.size());
-    }
-  }
 };
+
+
+
+// ---- 第十五轮: 切板取证基础设施 ----
+// 环形缓冲记最近 10 帧的选叶全景; 切板(选中中心跳>80px 或 EKF 解后丢失)时
+// 打印缓冲 + 后续 5 帧。平时零输出。
+struct FrameTrace
+{
+  int frame = -1;
+  double t = 0;
+  cv::Point2f chosen{-1.f, -1.f};
+  int chosen_class = -1;
+  float chosen_prob = 0.f;
+  int lock_event = 0;   // 0无 1续锁 2丢1 3释放 4幽灵找回 5幽灵未中 6偏下 7冷启动
+  float lock_dist = -1.f;
+  int cand_count = 0;   // 环带门后候选数
+  int cand_count_raw = 0;  // 环带门前原始候选数
+  std::vector<std::pair<cv::Point2f, float>> cands;  // 候选(中心, 置信度)
+  bool cands_truncated = false;
+};
+
+void print_trace(const FrameTrace & ft)
+{
+  std::string ev;
+  switch (ft.lock_event) {
+    case 0: ev = "NONE"; break;
+    case 1: ev = "KEEP"; break;
+    case 2: ev = "MISS1"; break;
+    case 3: ev = "RELEASE"; break;
+    case 4: ev = "GHOST_HIT"; break;
+    case 5: ev = "GHOST_MISS"; break;
+    case 6: ev = "LOWER"; break;
+    case 7: ev = "COLDSTART"; break;
+    default: ev = "?";
+  }
+  std::string cands;
+  for (const auto & c : ft.cands) {
+    cands += fmt::format("({:.0f},{:.0f})p{:.2f} ", c.first.x, c.first.y, c.second);
+  }
+  if (ft.cands_truncated) cands += "...";
+  if (ft.chosen.x < 0) {
+    tools::logger()->info(
+      "  帧{} t={:.3f} | 无选中 | {} | 候选 {}/{}", ft.frame, ft.t, ev, ft.cand_count,
+      ft.cand_count_raw);
+  } else {
+    tools::logger()->info(
+      "  帧{} t={:.3f} | 选中({:.0f},{:.0f}) cls{} p{:.2f} | {} d{:.1f}px | 候选 {}",
+      ft.frame, ft.t, ft.chosen.x, ft.chosen.y, ft.chosen_class, ft.chosen_prob, ev,
+      ft.lock_dist, cands.empty() ? "0" : cands);
+  }
+}
 
 template <typename TargetT>
 void run(
-  cv::VideoCapture & video, std::ifstream & text, bool has_quaternion, double fps,
-  const std::string & config_path, int start_index, int end_index, tools::Plotter & plotter,
-  tools::Exiter & exiter, bool no_stage2)
+  cv::VideoCapture & video, const std::string & video_path, std::ifstream & text, bool has_quaternion,
+  double fps, const std::string & config_path, int start_index, int end_index, tools::Plotter & plotter,
+  tools::Exiter & exiter, bool no_stage2, bool big = false)
 {
   auto_buff::Buff_Detector detector(config_path);
   auto_buff::Solver solver(config_path);
   TargetT target;
   auto_buff::Aimer aimer(config_path);
+
+  // 大符旁路开关: small 走原 detect(), 行为零改动; big 走 detect_big(相位槽位选叶)。
+  // 相位提示来自上一帧 EKF 状态 x[5](转子相位), 未解算时 nullopt → 检测层退化最高分。
+  const bool use_big_detect = big;
 
   // 诊断开关, 默认 false → 生产行为逐位不变。开了之后 EKF 只做第一级(R 标)更新。
   target.diag_skip_stage2 = no_stage2;
@@ -342,6 +349,15 @@ void run(
   double prev_buff_yaw = 0, prev_buff_pitch = 0;
   bool has_prev_ypr = false;
 
+  // ---- 第十五轮: 切板取证状态 ----
+  // 环形缓冲最近 10 帧; 切板(选中中心跳>80px 或 EKF 解后丢失)触发打印
+  // 缓冲全部 + 后续 5 帧。平时零输出。
+  std::deque<FrameTrace> trace_buf;
+  cv::Point2f switch_prev_center{-1.f, -1.f};
+  bool switch_prev_valid = false;
+  int switch_pending = 0;   // >0 = 正在打印事件后续帧
+  bool prev_solved_trace = false;
+
   // 换叶取证用: 上一帧被选中那片叶的像素中心、class_id、原始 roll
   cv::Point2f prev_chosen_center{-1.f, -1.f};
   int prev_chosen_class = -1;
@@ -350,11 +366,98 @@ void run(
   bool has_prev_chosen = false;
   bool has_prev_raw_roll = false;
 
+
+  // ---- 重复帧检测(第八轮): 剔除录像 VFR→CFR 填充产生的"复制上帧"假帧 ----
+  // 背景: 符.avi 实测 29% 的帧是 H.264 skip 帧(stsz <1KB, 最小 30B),
+  // 时间戳声称均匀 30fps 但有效内容仅 ~21fps。这些帧上 raw_roll 与上帧
+  // 几乎不变 → 差分出 ≈0°/s 假观测; 下一个内容帧跨过重复帧 → 差分出
+  // 2~3 倍真实值的假速度。帧356~360 roll 累加 = -120°/s(真实峰值),
+  // 证明图像内容正常、只是时间轴有假帧。
+  // 处理: 图像差分判重后, 重复帧的时间戳钉在上一内容帧(即 dt=0)。
+  // EKF 对 dt=0 的 predict 是零步长, update 观测与上帧相同, 无害;
+  // 差分仪表靠 dt>1e-6 保护自然跳过, 不需要额外断开差分链。
+  // 只在离线测试做——生产链路接相机实时流, 无重复帧, 逻辑不进 tasks/。
+  cv::Mat prev_content_frame;  // 上一"内容帧"的灰度缩略图(差分基准)
+  bool has_prev_content = false;
+  long dup_frame_skipped = 0;   // 被判重复的帧数
+  long content_frame_cnt = 0;   // 内容帧数
+  double dup_diff_sum = 0.0;    // 差分均值累计(供阈值标定)
+  long dup_diff_cnt = 0;
+  double last_content_t = 0.0;   // 上一内容帧时间戳(重复帧钉回用)
+  double dup_threshold = 1.0;         // 判重阈值: run() 开头预扫描自动标定(见下)
+
   // 合法交接判别用: 上一帧的已激活候选数, 以及距最近一次"激活数增加"过了几帧。
   // 初值给一个大数, 免得开头几帧的中心跳被误判成交接。
   int prev_activated = 0;
   bool has_prev_activated = false;
   int frames_since_activation = 1000;
+
+  // ---- 第十轮: 判重阈值预扫描标定 ----
+  // 第九轮实测(阈 1.0): 判重 271(46.6%), 但仍有 -15/-17°/s 的近重复帧漏判 ——
+  // 固定阈值落在双峰之间的灰区。健康判据: 差分值呈双峰(近 0 的 skip 峰 vs
+  // 大幅运动的内容峰), 谷底才是正确阈值。这里全片预扫一遍差分序列, 取直方图
+  // 的最大间隔中点为阈值; 若无双峰(健康录像), 全片差分都大, 阈值落在最大
+  // 差分之上 → 判重恒 0, 行为与无检测一致。
+  {
+    // 第十三轮: 预扫描改用独立 VideoCapture 句柄。
+    // 根因: 旧代码在主 video 上读到 EOF 后用 CAP_PROP_POS_FRAMES seek 回退,
+    // 对 OpenCV 流式写出的 MJPG AVI(RIFF size=0xFFFFFFFF, 无 idx1 索引)seek 失效
+    // —— 主循环第一帧就空读退出, 秒退无任何仪表输出(2026-09-13 23:51 实测)。
+    // 独立句柄对主 video 的位置零影响, 任何容器格式都成立。
+    cv::VideoCapture prescan(video_path);
+    if (!prescan.isOpened()) {
+      tools::logger()->warn("预扫描打不开录像(判重阈值按禁用处理): {}", video_path);
+    }
+    cv::Mat f0, f1;
+    std::vector<double> diffs;
+    while (prescan.read(f1)) {
+      if (!f0.empty()) {
+        cv::Mat g0, g1;
+        cv::cvtColor(f0, g0, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(f1, g1, cv::COLOR_BGR2GRAY);
+        cv::resize(g0, g0, {}, 0.25, 0.25);
+        cv::resize(g1, g1, {}, 0.25, 0.25);
+        cv::Mat d;
+        cv::absdiff(g0, g1, d);
+        diffs.push_back(cv::mean(d)[0]);
+      }
+      f0 = f1.clone();
+    }
+    prescan.release();
+    if (diffs.size() >= 10) {
+      std::vector<double> sorted_diffs = diffs;
+      std::sort(sorted_diffs.begin(), sorted_diffs.end());
+      // 双峰性检验: 只有"近零簇"(差分 < 0.5, 即解码噪声级)占比 ≥ 10% 才认为
+      // 录像含重复帧。健康录像(全内容帧)相邻差分都在 3 以上, 近零簇为 0,
+      // 此时禁用判重 —— 否则谷底搜索会把阈值放到噪声间隔上, 全片误判。
+      size_t near_zero = 0;
+      for (double d : sorted_diffs)
+        if (d < 0.5) near_zero++;
+      if (static_cast<double>(near_zero) / static_cast<double>(sorted_diffs.size()) < 0.10) {
+        dup_threshold = std::numeric_limits<double>::max();  // 禁用
+        tools::logger()->info(
+          "[判重阈值] 预扫描 {} 帧: 近零帧占比 {:.1f}% < 10%, 判定健康录像, 重复帧检测禁用",
+          diffs.size(), 100.0 * static_cast<double>(near_zero) / static_cast<double>(sorted_diffs.size()));
+      } else {
+        // 双峰谷底: 低簇上界与高簇下界之间的最大间隔中点。
+        // 低簇 = 近零簇外延(到谷底), 只在 < 10 的低区找, 排除场景突变野值。
+        size_t best_i = 0;
+        double best_gap = 0.0;
+        for (size_t i = 0; i + 1 < sorted_diffs.size(); i++) {
+          const double gap = sorted_diffs[i + 1] - sorted_diffs[i];
+          if (sorted_diffs[i] < 10.0 && gap > best_gap) {
+            best_gap = gap;
+            best_i = i;
+          }
+        }
+        dup_threshold = (sorted_diffs[best_i] + sorted_diffs[best_i + 1]) / 2.0;
+        tools::logger()->info(
+          "[判重阈值] 预扫描 {} 帧, 阈值 {:.2f} (谷底两侧 {:.2f}/{:.2f}), 近零帧 {}/{}",
+          diffs.size(), dup_threshold, sorted_diffs[best_i], sorted_diffs[best_i + 1],
+          near_zero, sorted_diffs.size());
+      }
+    }
+  }
 
   for (int frame_count = start_index; !exiter.exit(); frame_count++) {
     if (end_index > 0 && frame_count > end_index) break;
@@ -363,7 +466,35 @@ void run(
     if (img.empty()) break;
     stats.frames++;
 
+    // ---- 重复帧判定(第八轮): 与上一内容帧做降采样灰度差分 ----
+    // 阈值 1.0(0~255 灰度均值): 大符相邻内容帧叶片移动 3~5°, 边缘扫过
+    // 全画面相当比例像素, 均值差远大于 1; skip 帧的解码噪声 <0.5。
+    // 先用仪表统计验证阈值, 不拍脑袋定案(见循环尾部累计输出)。
+    bool is_dup_frame = false;
+    {
+      cv::Mat gray_small;
+      cv::cvtColor(img, gray_small, cv::COLOR_BGR2GRAY);
+      cv::resize(gray_small, gray_small, {}, 0.25, 0.25);
+      if (has_prev_content) {
+        cv::Mat diff;
+        cv::absdiff(gray_small, prev_content_frame, diff);
+        const double mean_diff = cv::mean(diff)[0];
+        dup_diff_sum += mean_diff;
+        dup_diff_cnt++;
+        is_dup_frame = (mean_diff < dup_threshold);
+      }
+      if (!is_dup_frame) {
+        prev_content_frame = gray_small.clone();
+        has_prev_content = true;
+        content_frame_cnt++;
+      } else {
+        dup_frame_skipped++;
+      }
+    }
+
     // 时间戳: 有日志用日志的 t, 没有就按帧率推算。EKF 的 dt 靠这个, 不能省。
+    // 第八轮: 重复帧的 t 钉在上一内容帧时刻 —— 该帧图像是复制的, 它在
+    // 物理时间轴上不存在, 让 EKF/差分仪表看到 dt=0 而不是假 dt=1/fps。
     double t = frame_count / fps;
     Eigen::Quaterniond q(1, 0, 0, 0);
     if (has_quaternion) {
@@ -371,7 +502,22 @@ void run(
       if (text >> tt >> w >> x >> y >> z) {
         t = tt;
         q = Eigen::Quaterniond(w, x, y, z);
+      } else {
+        // 第十二轮: 录像帧数 > 日志行数时终止回放, 而不是回退 frame_count/fps。
+        // 新录像(符/MJPG) 解码 1368 帧 vs 日志 1362 行: 若继续跑, 第 1363 帧的 t
+        // 从 13.97s 跳回 45.4s(容器 30fps 推算), dt≈31s 的假时间戳会以巨大假速度
+        // 尖峰污染 EKF 与 RANSAC。录像与日志必须同步, 耗尽即停。
+        tools::logger()->warn(
+          "四元数日志在第 {} 帧耗尽, 录像帧数与日志行数不同步, 提前终止回放", frame_count);
+        break;
       }
+    }
+    // 第八轮: 重复帧时间戳钉回上一内容帧。仅无四元数日志时安全(t 纯推算);
+    // 有四元数时日志的 t 与云台姿态绑定, 不能改, 此时只靠差分链断开兜底。
+    if (is_dup_frame && !has_quaternion) {
+      t = last_content_t;
+    } else {
+      last_content_t = t;
     }
     auto timestamp = t0 + std::chrono::microseconds(int(t * 1e6));
 
@@ -379,7 +525,15 @@ void run(
 
     solver.set_R_gimbal2world(q);
 
-    auto power_runes = detector.detect(img);
+    // 大符: 把 EKF 上一帧转子相位喂给检测层做槽位归位; 小符: 原 detect() 不动。
+    std::optional<auto_buff::PowerRune> power_runes;
+    if (use_big_detect) {
+      std::optional<double> phase_hint;
+      if (!target.is_unsolve() && target.ekf_x().size() > 5) phase_hint = target.ekf_x()[5];
+      power_runes = detector.detect_big(img, phase_hint);
+    } else {
+      power_runes = detector.detect(img);
+    }
 
     solver.solve(power_runes);
 
@@ -401,7 +555,7 @@ void run(
       data["buff_R_dis"] = p.ypd_in_world[2];
       data["buff_yaw"] = p.ypr_in_world[0] * 57.3;
       data["buff_pitch"] = p.ypr_in_world[1] * 57.3;
-      data["buff_roll"] = p.ypr_in_world[2] * 57.3;
+      data["buff_roll"] = p.blade_phase * 57.3;  // 第七轮: 几何相位, 与 EKF 观测同源
       data["buff_class_id"] = p.class_id;
       stats.class_hist[p.class_id]++;
       stats.add_dis(p.ypd_in_world[2]);
@@ -453,6 +607,12 @@ void run(
       const auto & ds = detector.last_decode_stats();
       stats.candidate_count_hist[ds.candidate_count]++;
 
+      // ---- 环带门仪表采集 ----
+      for (float v : ds.cand_radius_ratios) stats.cand_radius_ratios.push_back(v);
+      for (float v : ds.kpt_radius_ratios) stats.kpt_radius_ratios.push_back(v);
+      stats.ring_cand_reject_total += ds.ring_gate_cand_reject;
+      stats.ring_kpt_reject_total += ds.ring_gate_kpt_reject;
+
       // 已激活候选数(class_id != 0)。它增加 = 有叶刚被打亮 → 目标必然换扇臂,
       // 那种中心跳是合法交接, 不是缺陷。这里维护一个"最近几帧是否发生过激活"的计数器。
       const int activated_now = static_cast<int>(std::count_if(
@@ -471,38 +631,16 @@ void run(
       stats.class0_count_hist[static_cast<int>(
         std::count(ds.class_ids.begin(), ds.class_ids.end(), 0))]++;
 
-      if (has_prev_chosen && ds.chosen_center.x >= 0) {
-        const double jump = cv::norm(ds.chosen_center - prev_chosen_center);
-        // 阈值 80 px: 9 m 处相邻叶心间距远大于此, 而同一片叶单帧位移(60°/s ÷ 50fps
-        // = 1.2°)远小于此, 所以这个阈值能把"换叶"和"正常旋转"分开。
-        if (jump > 80.0) {
-          stats.chosen_center_jump++;
-          stats.chosen_center_jump_max = std::max(stats.chosen_center_jump_max, jump);
-          // 性质区分: 3 帧内刚发生过"已激活数增加" → 目标叶刚被打熄, 换扇臂是正确行为。
-          if (frames_since_activation <= 3)
-            stats.center_jump_handover++;
-          else
-            stats.center_jump_abnormal++;
-          // 缺口 1: 按"当帧候选数"归属。当帧只有 1 个候选却仍跳, 说明上层无从选起,
-          // 问题在 NMS/置信度层而非选叶策略。
-          if (ds.candidate_count <= 1)
-            stats.center_jump_single_cand++;
-          else
-            stats.center_jump_multi_cand++;
-        }
-        if (ds.chosen_class_id != prev_chosen_class) stats.chosen_class_switch++;
-      }
-      if (ds.chosen_center.x >= 0) {
-        prev_chosen_center = ds.chosen_center;
-        prev_chosen_class = ds.chosen_class_id;
-        has_prev_chosen = true;
-      }
+
 
       // roll 跳变按 72° 整数倍归类。用的是 PnP 直出的原始 roll,
       // 必须在 buff_target 把它拉到最近 72° 倍数之前取。
       // 注意只在"连续两帧都有检测"时统计: 中间断过帧, 真实旋转本身就会累积角度,
       // 那种跳变不是换叶造成的, 计进来会虚高。
-      const double raw_roll = p.ypr_in_world[2];
+      // 第七轮: raw_roll 改用几何相位 blade_phase, 与 BigTarget EKF 观测同源。
+      // 原 ypr[2] 欧拉分解在 IPPE 双解翻转时会把 yaw/pitch 跳变泄漏进 roll,
+      // 造成隔帧 -132~-312 deg/s 的物理不可能差分速度(2026-09-13 18:32 日志)。
+      const double raw_roll = p.blade_phase;
       if (has_prev_raw_roll) {
         const double signed_d_roll = tools::limit_rad(raw_roll - prev_raw_roll);
         const double d_roll = std::abs(signed_d_roll);
@@ -517,12 +655,15 @@ void run(
         else
           stats.raw_roll_rate_skipped++;
       }
-      prev_raw_roll = raw_roll;
-      prev_raw_roll_t = t;
-      has_prev_raw_roll = true;
+
     }
 
     // 本帧没检测 → 断开连续性, 下一帧不与"上一次有检测的帧"作差
+    // 第八轮注: 重复帧**不**断开。时间戳已钉回内容帧时刻, 差分块内
+    // dt=0 → 所有差分消费端(dt>1e-6 保护)自动失效, 不会输出假速度;
+    // 而基线仍会以"钉回的 t"刷新(≈内容帧时刻), 下一个内容帧跨重复帧
+    // 作差, dt 正好等于真实内容间隔。若在此断开反而销毁基线,
+    // 让重复帧之后的内容帧也丢一次有效观测。
     if (!power_runes.has_value()) {
       has_prev_chosen = false;
       has_prev_raw_roll = false;
@@ -530,13 +671,90 @@ void run(
       // 激活数不清: 空窗期间叶片不会变回未激活, 断开只会让重捕获后的第一次
       // 比较凭空产生一个"激活事件"。保留 prev_activated 更贴近物理。
     }
-
     const bool solved_now = !target.is_unsolve();
     if (solved_now) stats.solved++;
     if (prev_solved && !solved_now) stats.lost_after_solved++;
     prev_solved = solved_now;
+      // ---- 第十五轮: 切板取证日志(替换第四~十四轮全部转速仪表) ----
+      // 设计: 环形缓冲记最近 10 帧全景(帧号/选中中心/锁定事件/候选列表),
+      // 检测到"选中叶跳 >80px"(= 换板)时, 把缓冲连同后续 5 帧一起打印。
+      // 平时零输出。数据源: detect_big 回填的真实选中项(修复了旧仪表记录
+      // objects[0] 的盲区 —— 之前换叶取证量的根本不是实际选中的那片叶)。
+      {
+        const auto & ds_now = detector.last_decode_stats();
+        const bool has_choice = (ds_now.chosen_center.x >= 0);
 
-    if (solved_now) {
+        // 每帧先记入环形缓冲
+        if (has_choice) {
+          FrameTrace ft;
+          ft.frame = frame_count;
+          ft.t = t;
+          ft.chosen = ds_now.chosen_center;
+          ft.chosen_class = ds_now.chosen_class_id;
+          ft.chosen_prob = ds_now.chosen_prob;
+          ft.lock_event = ds_now.lock_event;
+          ft.lock_dist = ds_now.lock_dist_px;
+          ft.cand_count = ds_now.candidate_count;
+          ft.cand_count_raw = ds_now.cand_count_raw;
+          for (size_t ci = 0; ci < ds_now.cand_centers.size() && ci < 6; ci++) {
+            ft.cands.emplace_back(ds_now.cand_centers[ci], ds_now.cand_probs[ci]);
+          }
+          if (ds_now.cand_centers.size() > 6) ft.cands_truncated = true;
+          trace_buf.push_back(std::move(ft));
+          if (trace_buf.size() > 10) trace_buf.pop_front();  // 环形缓冲: 只留最近 10 帧
+        }
+
+        // 无检测帧也要留痕(候选空 → 锁定 MISS 的关键现场), 用占位记录
+        if (!has_choice) {
+          FrameTrace ft;
+          ft.frame = frame_count;
+          ft.t = t;
+          ft.chosen = {-1.f, -1.f};
+          ft.cand_count = 0;
+          ft.cand_count_raw = ds_now.cand_count_raw;
+          ft.lock_event = ds_now.lock_event;
+          trace_buf.push_back(std::move(ft));
+          if (trace_buf.size() > 10) trace_buf.pop_front();  // 环形缓冲: 只留最近 10 帧
+        }
+
+        // 切板判定: 选中中心跳 >80px(与 detect_big 续锁门同阈值)
+        bool switched = false;
+        if (has_choice && switch_prev_valid) {
+          const double jump = cv::norm(ds_now.chosen_center - switch_prev_center);
+          if (jump > 80.0) switched = true;
+        }
+        if (has_choice) {
+          switch_prev_center = ds_now.chosen_center;
+          switch_prev_valid = true;
+        }
+        // EKF 解后丢失也触发(可能是锁定释放造成的)
+        if (prev_solved_trace && !solved_now) switched = true;
+
+        if (switched) {
+          stats.chosen_center_jump++;
+          switch_pending = 6;  // 事件帧 + 后续 5 帧继续打印
+          if (!trace_buf.empty()) {
+            tools::logger()->warn(
+              "======== 切板事件 @ 帧{} (t={:.2f}s) 上下文如下 ========", frame_count, t);
+            for (const auto & ft : trace_buf) print_trace(ft);
+          }
+        } else if (switch_pending > 0) {
+          // 事件后的后续帧
+          if (!trace_buf.empty()) print_trace(trace_buf.back());
+          switch_pending--;
+          if (switch_pending == 0)
+            tools::logger()->info("======== 切板上下文结束 ========");
+        }
+
+        prev_solved_trace = solved_now;
+      }
+
+
+    // 第十八轮 keep-alive 修复: solved_now 只表示 EKF 在输出(含无观测的纯 predict 帧),
+    // 不保证本帧有检测。旧代码在这里无条件 value() —— keep-alive 生效后第一个
+    // 无检测帧(solved=true + nullopt)即抛 bad_optional_access 崩溃。
+    // EKF 侧的绿框/蓝框/数据在无检测帧依然有效, 只有依赖 p(检测观测)的部分跳过。
+    if (solved_now && power_runes.has_value()) {
       auto & p = power_runes.value();
 
       // 显示
@@ -576,6 +794,34 @@ void run(
       cv::circle(img, image_points[6], 6, {0, 255, 0}, 1, cv::LINE_AA);
       stats.ekf_r_err.push_back(cv::norm(image_points[6] - p.r_center));
       const cv::Point2f green_blade = image_points[4];  // 绿框叶心(700mm 点)
+// ---- 第二十轮: 绿框漂移分量分解仪表(生产链路零改动, 只加测量) ----
+// green_blade = EKF 状态重投影的叶心; pnp_blade = 纯 PnP 位姿的叶心(700mm 点)。
+// 两者都是 700mm 点且都经过同一套投影, 差值就是 EKF 状态(x[4]yaw / x[5]roll /
+// x[0..3]R 轴)与几何层(PnP)的偏差, 与 R_len/C_len 无关(两者同乘同组参数)。
+// 把欧氏距离分解成绕 R 角度差 + 径向长度差, 能区分:
+//   角度差大 -> 相位(roll)状态偏, 框沿圆周漂
+//   径向差大 -> 转轴(R_yaw/R_pitch/R_dis)或 yaw 状态偏, 框沿径向漂
+{
+  const cv::Point2f R_obs = p.r_center;
+  const double dx = green_blade.x - pnp_blade.x;
+  const double dy = green_blade.y - pnp_blade.y;
+  double ang_obs = std::atan2(pnp_blade.y - R_obs.y, pnp_blade.x - R_obs.x) * 57.2957795;
+  double ang_grn = std::atan2(green_blade.y - R_obs.y, green_blade.x - R_obs.x) * 57.2957795;
+  double d_roll = ang_grn - ang_obs;
+  while (d_roll > 180.0) d_roll -= 360.0;
+  while (d_roll <= -180.0) d_roll += 360.0;
+  const double r_green = std::hypot(green_blade.x - R_obs.x, green_blade.y - R_obs.y);
+  const double r_obs = std::hypot(pnp_blade.x - R_obs.x, pnp_blade.y - R_obs.y);
+  const double d_radius = r_green - r_obs;
+  const double axis_err = cv::norm(image_points[6] - R_obs);
+  const double yaw_diff = tools::limit_rad(target.ekf_x()[4] - p.ypr_in_world[0]) * 57.2957795;
+  stats.add_green_drift(d_roll, d_radius, dx, dy, yaw_diff, axis_err, frame_count, t, target.ekf_x()[5] * 57.3, solver.last_solve_used_r() ? 1 : 2);
+  data["green_dx"] = dx;
+  data["green_dy"] = dy;
+  data["green_droll"] = d_roll;
+  data["green_dradius"] = d_radius;
+  data["green_yaw_diff"] = yaw_diff;
+}
 
       // 蓝色 = 预测(超前)位置, 应当沿旋转方向领先绿色
       auto Rxyz_in_world_pre = target_copy.point_buff2world(Eigen::Vector3d(0.0, 0.0, 0.0));
@@ -586,44 +832,6 @@ void run(
         img, std::vector<cv::Point2f>(image_points.begin(), image_points.begin() + 4), {255, 0, 0});
       cv::line(img, image_points[4], image_points[6], {255, 0, 0}, 1, cv::LINE_AA);
       stats.pre_r_err.push_back(cv::norm(image_points[6] - p.r_center));
-
-      // ---- 绿蓝夹角仪表: 以 R 十字为顶点量三框的角度 ----
-      // 共速判据: 夹角(蓝领先绿的角)恒定 ⟺ 绿蓝共速。夹角突变 = spd 被冲击。
-      {
-        const double spd_now = target.ekf_x()[6];  // spd 冲击的直接证据
-        const cv::Point2f blue_blade = image_points[4];
-        const cv::Point2f rv = p.r_center;
-        const auto angle_at = [&rv](const cv::Point2f & pt) {
-          return std::atan2(static_cast<double>(pt.y - rv.y), static_cast<double>(pt.x - rv.x));
-        };
-        const double ang_green = angle_at(green_blade);
-        const double ang_blue = angle_at(blue_blade);
-        const double ang_obs = angle_at(p.target().center);
-        auto wrap_deg = [](double rad) {
-          double d = rad * 57.29577951308232;
-          while (d > 180.0) d -= 360.0;
-          while (d < -180.0) d += 360.0;
-          return d;
-        };
-        const double gb = wrap_deg(ang_blue - ang_green);  // 蓝领先绿的角
-        const double lag = wrap_deg(ang_obs - ang_green);  // 观测领先绿的角(正=绿滞后)
-        if (!stats.gb_angle.empty()) {
-          // gb 与 back() 都是度, 直接作差后绕回 ±180 (wrap_deg 是弧度→度, 不能用)
-          double d_gb = gb - stats.gb_angle.back();
-          while (d_gb > 180.0) d_gb -= 360.0;
-          while (d_gb < -180.0) d_gb += 360.0;
-          const double abs_d = std::abs(d_gb);
-          if (abs_d > 5.0) {
-            stats.gb_angle_jump++;
-            stats.gb_angle_jump_max = std::max(stats.gb_angle_jump_max, abs_d);
-            tools::logger()->info(
-              "帧 {} 绿蓝夹角突变: {:+.1f}° → {:+.1f}° (Δ{:+.1f}°) | spd {:.1f}°/s | 绿滞后 {:+.1f}°",
-              frame_count, stats.gb_angle.back(), gb, d_gb, spd_now * 57.29577951308232, lag);
-          }
-        }
-        stats.gb_angle.push_back(gb);
-        stats.green_lag.push_back(lag);
-      }
 
       // 观测器内部数据
       Eigen::VectorXd x = target.ekf_x();
@@ -685,8 +893,6 @@ void run(
 
     plotter.plot(data);
 
-    // 每 100 帧打一次阶段摘要, 长录像也能中途看趋势
-    if (stats.frames % 100 == 0) stats.print("阶段摘要");
 
     cv::Mat show;
     cv::resize(img, show, {}, 0.6, 0.6);
@@ -704,7 +910,83 @@ void run(
     if (key == 'q') break;
   }
 
-  stats.print("最终摘要");
+
+  // ---- 第二十轮: 绿框漂移分量分解摘要(结尾一次性输出, 只读) ----
+  if (!stats.green_dr.empty()) {
+    auto median_of = [](std::vector<double> v) {
+      if (v.empty()) return 0.0;
+      std::sort(v.begin(), v.end());
+      return v.size() % 2 == 1 ? v[v.size() / 2]
+                               : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]);
+    };
+    auto mean_abs = [](const std::vector<double> & v) {
+      if (v.empty()) return 0.0;
+      double s = 0;
+      for (double x : v) s += std::abs(x);
+      return s / static_cast<double>(v.size());
+    };
+    auto max_abs = [](const std::vector<double> & v) {
+      double m = 0;
+      for (double x : v) m = std::max(m, std::abs(x));
+      return m;
+    };
+    tools::logger()->info(
+      "[绿框漂移] n={} | |d| med/mean {:.1f}/{:.1f}px | dx med {:+.1f} dy med {:+.1f} | "
+      "droll med {:+.2f}deg mean|.| {:.2f} | dradius med {:+.1f}px mean|.| {:.1f} | "
+      "yaw_diff med {:+.2f}deg | R轴端 mean|.| {:.1f}px max {:.1f}",
+      stats.green_dr.size(), median_of(stats.green_dr), mean_abs(stats.green_dr),
+      median_of(stats.green_dx), median_of(stats.green_dy), median_of(stats.green_droll),
+      mean_abs(stats.green_droll), median_of(stats.green_dradius),
+      mean_abs(stats.green_dradius), median_of(stats.green_yaw_state),
+      mean_abs(stats.green_R_axis_err), max_abs(stats.green_R_axis_err));
+    // 第二十二轮: 最差帧定位 —— 按无符号 |d| 排序, 输出 top10 与其分量。
+    // 与切板事件日志(帧号)对齐: 若 top 帧都落在切板/断流段附近, 说明是瞬态
+    // 而非稳态偏差; 若均匀分布, 说明是持续模型误差, 需要查 R 观测或相位模型。
+    {
+      std::vector<size_t> idx(stats.green_dr.size());
+      for (size_t k = 0; k < idx.size(); k++) idx[k] = k;
+      std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+        return stats.green_dr[a] > stats.green_dr[b]; });
+      const size_t n_top = std::min<size_t>(10, idx.size());
+      tools::logger()->info(
+        "[绿框漂移-top] |d| 最大的 {} 帧 (帧号 t | dx dy | droll dradius | yaw):", n_top);
+      for (size_t k = 0; k < n_top; k++) {
+        const size_t q = idx[k];
+        tools::logger()->info(
+          "  帧{} t={:.2f}s |d|={:.1f}px dx={:+.1f} dy={:+.1f} | droll={:+.2f}deg dradius={:+.1f}px | yaw={:+.2f}deg phase={:.1f}deg path={}",
+          stats.green_frame[q], stats.green_time[q], stats.green_dr[q],
+          stats.green_dx[q], stats.green_dy[q], stats.green_droll[q], stats.green_dradius[q],
+          stats.green_yaw_state[q], stats.green_phase[q], stats.green_solve_path[q]);
+      }
+      // 分位数: 确认误差集中度(p90 vs med)
+      std::vector<double> dr_sorted = stats.green_dr;
+      std::sort(dr_sorted.begin(), dr_sorted.end());
+      const auto q_at = [&](double q) -> double {
+        if (dr_sorted.empty()) return 0.0;
+        const size_t pos = static_cast<size_t>(q * (dr_sorted.size() - 1));
+        return dr_sorted[pos];
+      };
+      tools::logger()->info(
+        "[绿框漂移-分位] p50={:.1f} p75={:.1f} p90={:.1f} p95={:.1f} p99={:.1f} max={:.1f}px",
+        q_at(0.50), q_at(0.75), q_at(0.90), q_at(0.95), q_at(0.99), q_at(1.0));
+    }
+    // 方向判读: dx/dy 中位数给出漂移的主方向; droll vs dradius 判圆周 vs 径向
+    tools::logger()->info(
+      "[绿框漂移] dx mean|.| {:.1f} max {:.1f} | dy mean|.| {:.1f} max {:.1f} | "
+      "droll max {:.2f}deg | dradius max {:.1f}px",
+      mean_abs(stats.green_dx), max_abs(stats.green_dx), mean_abs(stats.green_dy),
+      max_abs(stats.green_dy), max_abs(stats.green_droll), max_abs(stats.green_dradius));
+  }
+  // ---- 第八轮: 重复帧检测统计 ----
+  // 阈值由预扫描自动标定(第十轮), 此处输出实际判重数与其对照 ——
+  // 判重数应与 stsz 小帧数同量级(符.avi ≈168+ 近似重复帧)。
+  if (dup_diff_cnt > 0) {
+    tools::logger()->info(
+      "[重复帧] 总帧 {} | 内容帧 {} | 判重 {} ({:.1f}%) | 差分均值 {:.3f} (阈 {:.2f})",
+      stats.frames, content_frame_cnt, dup_frame_skipped,
+      100.0 * static_cast<double>(dup_frame_skipped) / static_cast<double>(stats.frames),
+      dup_diff_sum / static_cast<double>(dup_diff_cnt), dup_threshold);
+  }
   cv::destroyAllWindows();
 }
 
@@ -773,16 +1055,9 @@ int main(int argc, char * argv[])
   // 四元数日志可选。没有就退化为单位四元数(云台系 == 世界系)。
   std::ifstream text(text_path);
   const bool has_quaternion = text.is_open();
-  if (has_quaternion)
-    tools::logger()->info("录像: {}, 四元数日志: {}", video_path, text_path);
-  else
-    tools::logger()->warn(
-      "录像: {} 无配套 {} —— 退化为单位四元数, 世界系判据(gimbal_*)不可用", video_path, text_path);
-
   // 没有四元数日志时用帧率推算时间戳。EKF 的 dt 依赖它, 取不到就退回 30 fps。
   double fps = video.get(cv::CAP_PROP_FPS);
   if (!(fps > 1.0) || !std::isfinite(fps)) {
-    tools::logger()->warn("录像未报告有效帧率, 按 30 fps 推算时间戳");
     fps = 30.0;
   }
 
@@ -793,11 +1068,9 @@ int main(int argc, char * argv[])
   // 这是个可否证的预测: 若撞门次数没归零, 说明 spd 上还有第二个机理。
   // 只影响测试推算时间戳, 生产代码用相机时间戳, 不受此参数影响。
   if (fps_override > 0) {
-    tools::logger()->warn("--fps {:.2f} 覆盖录像自报的 {:.2f} fps", fps_override, fps);
     fps = fps_override;
   }
 
-  tools::logger()->info("帧率 {:.2f} fps, 观测器 {}", fps, target_type);
 
   // --no-stage2: 只为把两个候选机理分开而存在的诊断开关, 不是修法。
   //
@@ -807,20 +1080,17 @@ int main(int argc, char * argv[])
   //   ekf_r_err 仍是 ~117   → 阶段 2 无关, 误差是 init 那几帧留下、被零 Q_ 锁死的
   // 注意这一路 yaw(x[4]) 会失去观测、停在 init 值, 绿色四边形的朝向因此不可信 ——
   // 但用户判据只看轴线端点(image_points[6]), 它只依赖 x[0]/x[2]/x[3], 不受影响。
-  if (no_stage2)
-    tools::logger()->warn(
-      "--no-stage2: EKF 第二级(叶心)更新已关闭 —— 这是诊断构型, 不是生产行为, "
-      "本轮的 spd/yaw 相关数字不可用作基线");
+  if (no_stage2) {
+  }
 
   if (target_type == "small")
     run<auto_buff::SmallTarget>(
-      video, text, has_quaternion, fps, config_path, start_index, end_index, plotter, exiter,
-      no_stage2);
+      video, video_path, text, has_quaternion, fps, config_path, start_index, end_index, plotter,
+      exiter, no_stage2, false);
   else
     run<auto_buff::BigTarget>(
-      video, text, has_quaternion, fps, config_path, start_index, end_index, plotter, exiter,
-      no_stage2);
-
+      video, video_path, text, has_quaternion, fps, config_path, start_index, end_index, plotter,
+      exiter, no_stage2, true);
   if (text.is_open()) text.close();
   return 0;
 }

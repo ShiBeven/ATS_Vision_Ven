@@ -216,7 +216,6 @@ bool Aimer::get_send_angle(
   // 考虑detecor所消耗的时间，此外假设aimer的用时可忽略不计
   // 如果 to_now 为 true，则根据当前时间和时间戳预测目标位置,deltatime = 现在时间减去当时照片时间，加上0.1
   target.predict(predict_time);
-  // std::cout << "gap: " << detect_now_gap << std::endl;
   angle = target.ekf_x()[5];
 
   // 计算目标点的空间坐标

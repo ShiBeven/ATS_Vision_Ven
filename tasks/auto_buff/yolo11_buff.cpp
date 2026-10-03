@@ -83,7 +83,6 @@ YOLO11_BUFF::YOLO11_BUFF(const std::string & config)
     model_path, device_, conf_threshold_, kpt_threshold_, min_valid_kpts_, center_dist_threshold_);
 
   model = core.read_model(model_path);
-  // printInputAndOutputsInfo(*model);  // 打印模型信息
   /// 载入并编译模型
   compiled_model = tools::ov_utils::compile_model_with_fallback(
     core, model, device_, "YOLO11_BUFF",
@@ -246,9 +245,29 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::decode(const cv::Mat & image)
 
   // 仪表: 记录 NMS 后的候选数与类别(按置信度降序, 与 indices 顺序一致)。只记录, 不改行为。
   stats_ = DecodeStats{};
+  stats_.cand_count_raw = static_cast<int>(raw_kpts.size());  // 第十五轮: NMS 前原始候选数
   stats_.candidate_count = static_cast<int>(indices.size());
   stats_.class_ids.reserve(indices.size());
   for (const int index : indices) stats_.class_ids.push_back(class_ids[index]);
+
+  // ---- 环带仪表(只记录, 不改行为; 门限由大符录像分布定, 见 DecodeStats 注释) ----
+  // 径向比 = 点到该候选自己 R 关键点的距离 / |top−bottom| 基线。
+  // 物理参考: 四角点 573~827mm / 254mm 基线 ≈ 1.97~3.26(装甲环带);
+  // 臂灯 220~500mm ≈ 0.87~1.97。待大符录像直方图出来后把门限写进 detect_big。
+  stats_.cand_radius_ratios.reserve(indices.size());
+  stats_.kpt_radius_ratios.reserve(indices.size() * 4);
+  for (const int index : indices) {
+    const auto & raw = raw_kpts[index];
+    const double baseline = cv::norm(raw[0] - raw[4]);  // top − bottom
+    if (baseline < 5.0) continue;  // 基线太小, 径向比无意义, 不记录
+    stats_.cand_radius_ratios.push_back(
+      static_cast<float>(cv::norm(centers[index] - raw[2]) / baseline));
+    for (int k = 0; k < 5; k++) {
+      if (k == 2) continue;  // R 标自身径向比为 0, 无意义
+      stats_.kpt_radius_ratios.push_back(
+        static_cast<float>(cv::norm(raw[k] - raw[2]) / baseline));
+    }
+  }
 
   std::vector<Object> objects;
   objects.reserve(indices.size());
@@ -307,12 +326,84 @@ std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_multicandidateboxes(cv::Mat & 
 
   auto objects = decode(image);
 
-  // 注意: 本入口"不"做 class_id 过滤, 与 get_onecandidatebox() 的行为有意不同。
-  // 它按设计返回全部候选, 由调用方自行取舍。当前 detect_24()/detect_debug() 走这里,
-  // 而这两个函数全仓无调用者、不在执行路径上, 所以未随修法 B 一起改。
-  // 若将来启用它们, 需自行处理"已激活的叶也在候选里"的问题, 否则会重现帧间换叶。
+  // ---- 环带门(2026-09-13, 大符臂灯杂点过滤) ----
+  // 只在多候选入口生效: 小符链路走 get_onecandidatebox(), 一个字节不受影响。
+  // 规则: 灯臂中部有 1/5~5/5 激活进度灯效, 网络会把它们当独立候选(形态 A)
+  // 或把选中候选的某个关键点拉到臂灯上(形态 B)。装甲几何先验:
+  //   四角点 r/baseline ∈ [1.97, 3.26](573~827mm / 254mm 基线)
+  //   臂灯   r/baseline ≤ ~1.97(500mm 以内)
+  // 候选层: 候选中心径向比 < 门 → 整个候选拒收(形态 A);
+  // 关键点层: 四角点任一越出 [门下限, 门上限] → 该点无置信度(形态 B),
+  //   连带让有效关键点计数下降, 与 min_valid_keypoints 机制自然衔接。
+  // 门限是物理推导初值, 留 ±0.35 余量; 待录像直方图出来后收紧。
+  constexpr float RING_MIN = 1.62f;  // 1.97 − 0.35
+  constexpr float RING_MAX = 3.61f;  // 3.26 + 0.35
+  constexpr float RING_MIN_BASELINE_PX = 5.0f;
+  int cand_reject = 0, kpt_reject = 0;
+  // ---- 第十八轮: 锁定邻域救援(方案四) ----
+  // 帧442 实锤固定门限会误杀真扇叶(A/B 同时被拒, 候选 0/2)→观测断流。
+  // 直接放宽门限有误收臂灯风险(臂灯与装甲在径向比上有重叠带), 所以
+  // 只对"身份已知"的候选豁免: 中心落在锁定叶邻域 40px 内(身份由
+  // detect_big 的近邻锁担保, 单帧位移 ~4px @97fps, 40px 已含大余量)的
+  // 被拒候选放行。臂灯永远在臂上、不在扇叶心, 不会被误豁免。
+  // 统计上单独记 ring_gate_rescued, 不与 reject 混淆。
+  constexpr float RING_RESCUE_PX = 40.0f;
+  const bool rescue_active = (ring_rescue_center_.x >= 0.f);
+  int rescued = 0;
+  std::vector<Object> accepted;
+  accepted.reserve(objects.size());
+  for (auto & obj : objects) {
+    const float baseline = static_cast<float>(cv::norm(obj.kpt[0] - obj.kpt[2]));
+    if (baseline < RING_MIN_BASELINE_PX) continue;  // 基线塌缩, 本身就是废候选
+    const float r_cand = static_cast<float>(cv::norm(obj.center - obj.r)) / baseline;
+    if (r_cand < RING_MIN) {
+      if (rescue_active &&
+          static_cast<float>(cv::norm(obj.center - ring_rescue_center_)) < RING_RESCUE_PX) {
+        rescued++;  // 锁定邻域救援: 身份已知的真扇叶被门限误杀, 放行
+      } else {
+        cand_reject++;
+        continue;  // 形态 A: 整个候选疑似臂灯
+      }
+    }
+    bool bad_kpt = false;
+    for (size_t k = 0; k < obj.kpt.size(); k++) {
+      const float r_k = static_cast<float>(cv::norm(obj.kpt[k] - obj.r)) / baseline;
+      if (r_k < RING_MIN || r_k > RING_MAX) {
+        // 形态 B(2026-09-13 修): 该角点不在装甲环带内 → 真实拒收整个候选。
+        // 旧代码只 kpt_reject++ 而不修改 obj, 注释与实现不符 —— 大符臂灯
+        // 关键点污染时该候选会带着异常角点进 detect_big, 污染 R 融合与
+        // 选叶, 是 raw_roll 隔帧交替最可疑的候选方向。
+        kpt_reject++;
+        bad_kpt = true;
+      }
+    }
+    if (bad_kpt) {
+      cand_reject++;  // 复用 cand_reject 计数(形态 A 候选中心越界 / 形态 B 关键点越界)
+      continue;       // 候选不进 accepted, 不参与后续 R 融合与选叶
+    }
+    accepted.push_back(std::move(obj));
+  }
+  stats_.ring_gate_cand_reject = cand_reject;
+  stats_.ring_gate_kpt_reject = kpt_reject;
+  stats_.ring_gate_rescued = rescued;  // 第十八轮: 救援计数(仪表)
+  objects = std::move(accepted);
+  // 第十五轮: 环带门后全候选记录(切板取证用), 与 accepted 同序
+  stats_.cand_centers.clear();
+  stats_.cand_probs.clear();
+  stats_.cand_rs.clear();
+  stats_.cand_centers.reserve(objects.size());
+  stats_.cand_probs.reserve(objects.size());
+  stats_.cand_rs.reserve(objects.size());
+  for (const auto & o : objects) {
+    stats_.cand_centers.push_back(o.center);
+    stats_.cand_probs.push_back(o.prob);
+    stats_.cand_rs.push_back(o.r);
+  }
 
-  // 仪表: detect_24 把候选[0]当 target 交给 PowerRune, 记下它
+  // 注意: 本入口"不"做 class_id 过滤, 与 get_onecandidatebox() 的行为有意不同。
+  // 它按设计返回全部候选, 由调用方自行取舍。大符旁路 detect_big() 走这里。
+
+  // 仪表: 记录(环带门后)候选[0], 与 chosen_* 语义保持一致
   if (!objects.empty()) {
     stats_.chosen_class_id = objects[0].class_id;
     stats_.chosen_center = objects[0].center;
@@ -391,48 +482,5 @@ void YOLO11_BUFF::convert(
   input.convertTo(output, CV_32F);
   if (normalize) output = output / 255.0;  // 归一化到[0, 1]
   if (BGR2RGB) cv::cvtColor(output, output, cv::COLOR_BGR2RGB);
-}
-
-void YOLO11_BUFF::printInputAndOutputsInfo(const ov::Model & network)
-{
-  std::cout << "model name: " << network.get_friendly_name() << std::endl;
-
-  const std::vector<ov::Output<const ov::Node>> inputs = network.inputs();
-  for (const ov::Output<const ov::Node> & input : inputs) {
-    std::cout << "    inputs" << std::endl;
-
-    const std::string name = input.get_names().empty() ? "NONE" : input.get_any_name();
-    std::cout << "        input name: " << name << std::endl;
-
-    const ov::element::Type type = input.get_element_type();
-    std::cout << "        input type: " << type << std::endl;
-
-    const ov::Shape shape = input.get_shape();
-    std::cout << "        input shape: " << shape << std::endl;
-  }
-
-  const std::vector<ov::Output<const ov::Node>> outputs = network.outputs();
-  for (const ov::Output<const ov::Node> & output : outputs) {
-    std::cout << "    outputs" << std::endl;
-
-    const std::string name = output.get_names().empty() ? "NONE" : output.get_any_name();
-    std::cout << "        output name: " << name << std::endl;
-
-    const ov::element::Type type = output.get_element_type();
-    std::cout << "        output type: " << type << std::endl;
-
-    const ov::Shape shape = output.get_shape();
-    std::cout << "        output shape: " << shape << std::endl;
-  }
-}
-
-void YOLO11_BUFF::save(const std::string & programName, const cv::Mat & image)
-{
-  const std::filesystem::path saveDir = "../result/";
-  if (!std::filesystem::exists(saveDir)) {
-    std::filesystem::create_directories(saveDir);
-  }
-  const std::filesystem::path savePath = saveDir / (programName + ".jpg");
-  cv::imwrite(savePath.string(), image);
 }
 }  // namespace auto_buff

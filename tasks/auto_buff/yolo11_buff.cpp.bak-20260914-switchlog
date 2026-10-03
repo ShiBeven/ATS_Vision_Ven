@@ -1,0 +1,457 @@
+﻿#include "yolo11_buff.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <sstream>
+#include <stdexcept>
+
+#include "tools/openvino_utils.hpp"
+#include "tools/path.hpp"
+#include "tools/yaml.hpp"
+
+namespace auto_buff
+{
+namespace
+{
+// 按符叶四个边缘点的中心距离执行非极大值抑制，移植自模型库
+// network_postprocess.cpp 的 centerDistanceNMS。
+// 新模型不输出检测框，所以用关键点中心距离代替 IoU。
+void center_distance_nms(
+  const std::vector<cv::Point2f> & centers, const std::vector<float> & confidences,
+  const std::vector<int> & class_ids, float center_dist_threshold, std::vector<int> & indices)
+{
+  indices.clear();
+  if (centers.empty()) return;
+
+  const int num = static_cast<int>(confidences.size());
+  std::vector<bool> suppressed(num, false);
+  const float dist_threshold_sq = center_dist_threshold * center_dist_threshold;
+
+  std::vector<int> sorted_indices(num);
+  std::iota(sorted_indices.begin(), sorted_indices.end(), 0);
+  std::sort(sorted_indices.begin(), sorted_indices.end(), [&confidences](int a, int b) {
+    return confidences[a] > confidences[b];
+  });
+
+  // 分组规则: class_id < 2(未激活 + 小符)为一组, class_id == 2(大符)为另一组, 跨组不互相抑制
+  auto same_group = [&class_ids](int a, int b) {
+    return (class_ids[a] < 2 && class_ids[b] < 2) || (class_ids[a] == 2 && class_ids[b] == 2);
+  };
+
+  for (size_t i = 0; i < sorted_indices.size(); i++) {
+    const int idx_i = sorted_indices[i];
+    if (suppressed[idx_i]) continue;
+    indices.push_back(idx_i);
+
+    for (size_t j = i + 1; j < sorted_indices.size(); j++) {
+      const int idx_j = sorted_indices[j];
+      if (suppressed[idx_j]) continue;
+      if (!same_group(idx_i, idx_j)) continue;
+
+      const float dx = centers[idx_i].x - centers[idx_j].x;
+      const float dy = centers[idx_i].y - centers[idx_j].y;
+
+      // 大符的距离阈值取基准值的 1/3, 这里比较的是平方值故除 9
+      const float threshold_sq =
+        (class_ids[idx_i] == 2) ? dist_threshold_sq / 9.0f : dist_threshold_sq;
+
+      if (dx * dx + dy * dy < threshold_sq) suppressed[idx_j] = true;
+    }
+  }
+}
+}  // namespace
+
+YOLO11_BUFF::YOLO11_BUFF(const std::string & config)
+{
+  auto yaml = tools::load(config);
+  std::string model_path =
+    tools::resolve_path_from_config_string(config, yaml["model"].as<std::string>());
+  device_ = yaml["device"] ? yaml["device"].as<std::string>() : "AUTO:GPU,CPU";
+
+  // 阈值提为配置项, 调参不必重新编译; 默认值取模型库官方值
+  conf_threshold_ = tools::read_or(yaml, "buff_confidence_threshold", 0.5);
+  kpt_threshold_ = tools::read_or(yaml, "buff_keypoint_threshold", 0.8);
+  min_valid_kpts_ = tools::read_or(yaml, "buff_min_valid_keypoints", 3);
+  center_dist_threshold_ = tools::read_or(yaml, "buff_center_dist_threshold", 100.0);
+
+  // 明确打印实际加载的模型绝对路径 —— 配置里写的是相对路径, 又经过
+  // resolve_path_from_config 多候选目录解析, 不打印就无法确认到底加载了哪个文件。
+  tools::logger()->info(
+    "[YOLO11_BUFF] model={}, device={}, conf={:.2f}, kpt_conf={:.2f}, min_kpts={}, "
+    "center_nms={:.1f}",
+    model_path, device_, conf_threshold_, kpt_threshold_, min_valid_kpts_, center_dist_threshold_);
+
+  model = core.read_model(model_path);
+  /// 载入并编译模型
+  compiled_model = tools::ov_utils::compile_model_with_fallback(
+    core, model, device_, "YOLO11_BUFF",
+    ov::hint::performance_mode(ov::hint::PerformanceMode::LATENCY));
+  /// 创建推理请求
+  infer_request = compiled_model.create_infer_request();
+  // 获取模型输入节点
+  input_tensor = infer_request.get_input_tensor();
+  input_tensor.set_shape({1, 3, INPUT_H, INPUT_W});  // 注意 H=480, W=640
+
+  /// 输出形状校验: 配置写错(例如仍指向旧 yolo11_buff_int8.xml)时立刻失败,
+  /// 而不是拿旧模型跑新解码得出满屏垃圾关键点
+  constexpr size_t EXPECTED_ROWS = 3 + NUM_POINTS * 3;  // 18
+  constexpr size_t EXPECTED_COLS = 6300;
+  const auto output_pshape = compiled_model.output().get_partial_shape();
+  if (output_pshape.is_static()) {
+    const ov::Shape shape = output_pshape.get_shape();
+    // 输出形状是"新模型 vs 旧模型"最硬的指纹: 新模型 [1,18,6300], 旧模型不是这个形状。
+    // 打成 info 而不只在失败时打, 这样正常启动的日志里也能直接核对。
+    std::ostringstream shape_str;
+    shape_str << shape;
+    tools::logger()->info("[YOLO11_BUFF] output shape={} (期望 [1,18,6300])", shape_str.str());
+    if (shape.size() != 3 || shape[1] != EXPECTED_ROWS || shape[2] != EXPECTED_COLS) {
+      std::ostringstream msg;
+      msg << "[YOLO11_BUFF] 模型输出形状为 " << shape << ", 期望 [1, " << EXPECTED_ROWS << ", "
+          << EXPECTED_COLS << "]。请检查 config 中 model: 是否指向 Rune 模型。";
+      throw std::runtime_error(msg.str());
+    }
+  } else {
+    tools::logger()->warn("[YOLO11_BUFF] 模型输出形状非静态, 跳过形状校验");
+  }
+}
+
+void YOLO11_BUFF::fill_tensor_data_image(ov::Tensor & input_tensor, const cv::Mat & input_image)
+{
+  /// letterbox 变换: 对齐模型库 network_preprocess.cpp 的 preProcessImage 语义 ——
+  /// 等比缩放, 长宽比一致时直接 resize 不产生 padding, 不一致时居中 copyMakeBorder。
+  const ov::Shape tensor_shape = input_tensor.get_shape();
+  const size_t num_channels = tensor_shape[1];
+  const size_t height = tensor_shape[2];
+  const size_t width = tensor_shape[3];
+
+  scale_ = std::min(height / float(input_image.rows), width / float(input_image.cols));
+  // round 而非截断, 避免小数误差导致少一个像素
+  const int new_w =
+    std::min(static_cast<int>(width), static_cast<int>(std::lround(input_image.cols * scale_)));
+  const int new_h =
+    std::min(static_cast<int>(height), static_cast<int>(std::lround(input_image.rows * scale_)));
+
+  cv::Mat blob_image;
+  if (new_w == int(width) && new_h == int(height)) {
+    // 正常路径: 1440x1080 与 640x480 长宽比同为 4:3, 不产生 padding
+    pad_x_ = 0;
+    pad_y_ = 0;
+    cv::resize(
+      input_image, blob_image, cv::Size(static_cast<int>(width), static_cast<int>(height)), 0, 0,
+      cv::INTER_LINEAR);
+  } else {
+    // 防御分支: 长宽比不一致时居中填充。填充值取模型库代码的 (124,124,124),
+    // 注意与 IR 的 rt_info pad_value=114 不一致, 以代码为准。
+    cv::Mat resized;
+    cv::resize(input_image, resized, cv::Size(new_w, new_h), 0, 0, cv::INTER_LINEAR);
+    pad_x_ = std::max(0, (int(width) - new_w) / 2);
+    pad_y_ = std::max(0, (int(height) - new_h) / 2);
+    cv::copyMakeBorder(
+      resized, blob_image, pad_y_, int(height) - new_h - pad_y_, pad_x_,
+      int(width) - new_w - pad_x_, cv::BORDER_CONSTANT, cv::Scalar(124, 124, 124));
+  }
+
+  convert(blob_image, blob_image, true, true);  // 归一化除 255 + BGR->RGB
+
+  /// 将图像数据填入input_tensor
+  float * const input_tensor_data = input_tensor.data<float>();
+  // 原有图片数据为 HWC格式，模型输入节点要求的为 CHW 格式
+  for (size_t c = 0; c < num_channels; c++) {
+    for (size_t h = 0; h < height; h++) {
+      for (size_t w = 0; w < width; w++) {
+        input_tensor_data[c * width * height + h * width + w] =
+          blob_image.at<cv::Vec<float, 3>>(h, w)[c];
+      }
+    }
+  }
+}
+
+std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::decode(const cv::Mat & image)
+{
+  /// 预处理
+  fill_tensor_data_image(input_tensor, image);
+
+  /// 执行推理计算
+  infer_request.infer();
+
+  /// 处理推理计算结果: 输出形状 [1, 18, 6300], 每列一个候选。
+  /// 18 = 3(类别分数) + 5(关键点) * 3(x, y, conf), 没有检测框也没有独立 objectness。
+  const ov::Tensor output = infer_request.get_output_tensor();
+  const ov::Shape output_shape = output.get_shape();
+  const float * output_buffer = output.data<const float>();
+  const int out_rows = output_shape[1];  // 18
+  const int out_cols = output_shape[2];  // 6300
+  const cv::Mat det_output(out_rows, out_cols, CV_32F, (float *)output_buffer);
+
+  std::vector<std::vector<cv::Point2f>> raw_kpts;  // 每项 5 个点, 网络原始顺序
+  std::vector<cv::Point2f> centers;                // 四角点均值, 供 NMS 用
+  std::vector<float> confidences;
+  std::vector<int> class_ids;
+
+  for (int i = 0; i < out_cols; i++) {
+    /// 三个类别通道取最大者, 最大分作为该候选置信度
+    int class_id = 0;
+    float best_score = det_output.at<float>(0, i);
+    for (int c = 1; c < NUM_CLASSES; c++) {
+      const float score = det_output.at<float>(c, i);
+      if (score > best_score) {
+        best_score = score;
+        class_id = c;
+      }
+    }
+    if (best_score < conf_threshold_) continue;
+
+    /// 关键点质量门槛: 达标点数不足则丢弃整个候选
+    int valid_count = 0;
+    for (int k = 0; k < NUM_POINTS; k++)
+      if (det_output.at<float>(3 + k * 3 + 2, i) > kpt_threshold_) valid_count++;
+    if (valid_count < min_valid_kpts_) continue;
+
+    /// 坐标还原到原图, 并做越界筛除。
+    /// 注意: 官方实现把越界检查放在 NMS 之后, 这里提前到入选前 ——
+    /// 越界候选本就要丢弃, 不该让它参与抑制把合法候选压掉。
+    std::vector<cv::Point2f> kpts(NUM_POINTS);
+    bool out_of_range = false;
+    for (int k = 0; k < NUM_POINTS; k++) {
+      const float x = (det_output.at<float>(3 + k * 3 + 0, i) - pad_x_) / scale_;
+      const float y = (det_output.at<float>(3 + k * 3 + 1, i) - pad_y_) / scale_;
+      if (x < 0 || x > image.cols || y < 0 || y > image.rows) {
+        out_of_range = true;
+        break;
+      }
+      kpts[k] = cv::Point2f(x, y);
+    }
+    if (out_of_range) continue;
+
+    // 候选中心取四角点均值, 跳过索引 2 的 R 点
+    const cv::Point2f center = (kpts[0] + kpts[1] + kpts[3] + kpts[4]) / 4.0f;
+
+    raw_kpts.push_back(std::move(kpts));
+    centers.push_back(center);
+    confidences.push_back(best_score);
+    class_ids.push_back(class_id);
+  }
+
+  if (class_ids.empty()) {
+    stats_ = DecodeStats{};  // 无候选也要清掉上一帧的记录, 否则诊断读到过期值
+    return {};
+  }
+
+  /// 中心距离 NMS(不是 IoU)
+  std::vector<int> indices;
+  center_distance_nms(
+    centers, confidences, class_ids, static_cast<float>(center_dist_threshold_), indices);
+
+  // 仪表: 记录 NMS 后的候选数与类别(按置信度降序, 与 indices 顺序一致)。只记录, 不改行为。
+  stats_ = DecodeStats{};
+  stats_.candidate_count = static_cast<int>(indices.size());
+  stats_.class_ids.reserve(indices.size());
+  for (const int index : indices) stats_.class_ids.push_back(class_ids[index]);
+
+  // ---- 环带仪表(只记录, 不改行为; 门限由大符录像分布定, 见 DecodeStats 注释) ----
+  // 径向比 = 点到该候选自己 R 关键点的距离 / |top−bottom| 基线。
+  // 物理参考: 四角点 573~827mm / 254mm 基线 ≈ 1.97~3.26(装甲环带);
+  // 臂灯 220~500mm ≈ 0.87~1.97。待大符录像直方图出来后把门限写进 detect_big。
+  stats_.cand_radius_ratios.reserve(indices.size());
+  stats_.kpt_radius_ratios.reserve(indices.size() * 4);
+  for (const int index : indices) {
+    const auto & raw = raw_kpts[index];
+    const double baseline = cv::norm(raw[0] - raw[4]);  // top − bottom
+    if (baseline < 5.0) continue;  // 基线太小, 径向比无意义, 不记录
+    stats_.cand_radius_ratios.push_back(
+      static_cast<float>(cv::norm(centers[index] - raw[2]) / baseline));
+    for (int k = 0; k < 5; k++) {
+      if (k == 2) continue;  // R 标自身径向比为 0, 无意义
+      stats_.kpt_radius_ratios.push_back(
+        static_cast<float>(cv::norm(raw[k] - raw[2]) / baseline));
+    }
+  }
+
+  std::vector<Object> objects;
+  objects.reserve(indices.size());
+  for (const int index : indices) {
+    const auto & raw = raw_kpts[index];
+    Object obj;
+    // 关键点重排 —— 整个移植的核心。
+    // 网络输出顺序为 top(0), left(1), R(2), right(3), bottom(4);
+    // buff_solver.hpp 的 OBJECT_POINTS 前四点顺序为 上/左/下/右。
+    // 所以 bottom(raw[4]) 要放到第 3 位、right(raw[3]) 放到第 4 位, 顺序才对齐,
+    // 这样 OBJECT_POINTS 的数值一个都不用改。
+    obj.kpt = {raw[0], raw[1], raw[4], raw[3]};
+    obj.r = raw[2];
+    obj.center = centers[index];
+    obj.class_id = class_ids[index];
+    obj.prob = confidences[index];
+    objects.push_back(std::move(obj));
+  }
+  return objects;
+}
+
+void YOLO11_BUFF::draw(cv::Mat & image, const std::vector<Object> & objects) const
+{
+  for (const auto & obj : objects) {
+    // 四角点带序号: 1 上 / 2 左 / 3 下 / 4 右, 用来验证关键点顺序
+    for (size_t i = 0; i < obj.kpt.size(); i++) {
+      cv::circle(image, obj.kpt[i], 3, cv::Scalar(255, 255, 0), -1, cv::LINE_AA);
+      cv::putText(
+        image, std::to_string(i + 1), obj.kpt[i] + cv::Point2f(5, -5), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+        cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+    }
+
+    // R 标用区别色(洋红)。这里用十字标记而不是带偏移的文字标签 ——
+    // 十字中心即 obj.r 本身，肉眼判断位置时不会被标签的偏移误导。
+    cv::drawMarker(image, obj.r, cv::Scalar(255, 0, 255), cv::MARKER_CROSS, 20, 1, cv::LINE_AA);
+    cv::circle(image, obj.r, 3, cv::Scalar(255, 0, 255), -1, cv::LINE_AA);
+
+    // 类别名 + 置信度
+    const std::string label = (obj.class_id >= 0 && obj.class_id < int(class_names.size()))
+                                ? class_names[obj.class_id]
+                                : "unknown";
+    cv::putText(
+      image, label + ":" + cv::format("%.2f", obj.prob), obj.center + cv::Point2f(-40, -10),
+      cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+  }
+}
+
+std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_multicandidateboxes(cv::Mat & image)
+{
+  const int64 start = cv::getTickCount();
+
+  if (image.empty()) {
+    tools::logger()->warn("Empty img!, camera drop!");
+    return {};
+  }
+
+  auto objects = decode(image);
+
+  // ---- 环带门(2026-09-13, 大符臂灯杂点过滤) ----
+  // 只在多候选入口生效: 小符链路走 get_onecandidatebox(), 一个字节不受影响。
+  // 规则: 灯臂中部有 1/5~5/5 激活进度灯效, 网络会把它们当独立候选(形态 A)
+  // 或把选中候选的某个关键点拉到臂灯上(形态 B)。装甲几何先验:
+  //   四角点 r/baseline ∈ [1.97, 3.26](573~827mm / 254mm 基线)
+  //   臂灯   r/baseline ≤ ~1.97(500mm 以内)
+  // 候选层: 候选中心径向比 < 门 → 整个候选拒收(形态 A);
+  // 关键点层: 四角点任一越出 [门下限, 门上限] → 该点无置信度(形态 B),
+  //   连带让有效关键点计数下降, 与 min_valid_keypoints 机制自然衔接。
+  // 门限是物理推导初值, 留 ±0.35 余量; 待录像直方图出来后收紧。
+  constexpr float RING_MIN = 1.62f;  // 1.97 − 0.35
+  constexpr float RING_MAX = 3.61f;  // 3.26 + 0.35
+  constexpr float RING_MIN_BASELINE_PX = 5.0f;
+  int cand_reject = 0, kpt_reject = 0;
+  std::vector<Object> accepted;
+  accepted.reserve(objects.size());
+  for (auto & obj : objects) {
+    const float baseline = static_cast<float>(cv::norm(obj.kpt[0] - obj.kpt[2]));
+    if (baseline < RING_MIN_BASELINE_PX) continue;  // 基线塌缩, 本身就是废候选
+    const float r_cand = static_cast<float>(cv::norm(obj.center - obj.r)) / baseline;
+    if (r_cand < RING_MIN) {
+      cand_reject++;
+      continue;  // 形态 A: 整个候选疑似臂灯
+    }
+    bool bad_kpt = false;
+    for (size_t k = 0; k < obj.kpt.size(); k++) {
+      const float r_k = static_cast<float>(cv::norm(obj.kpt[k] - obj.r)) / baseline;
+      if (r_k < RING_MIN || r_k > RING_MAX) {
+        // 形态 B(2026-09-13 修): 该角点不在装甲环带内 → 真实拒收整个候选。
+        // 旧代码只 kpt_reject++ 而不修改 obj, 注释与实现不符 —— 大符臂灯
+        // 关键点污染时该候选会带着异常角点进 detect_big, 污染 R 融合与
+        // 选叶, 是 raw_roll 隔帧交替最可疑的候选方向。
+        kpt_reject++;
+        bad_kpt = true;
+      }
+    }
+    if (bad_kpt) {
+      cand_reject++;  // 复用 cand_reject 计数(形态 A 候选中心越界 / 形态 B 关键点越界)
+      continue;       // 候选不进 accepted, 不参与后续 R 融合与选叶
+    }
+    accepted.push_back(std::move(obj));
+  }
+  stats_.ring_gate_cand_reject = cand_reject;
+  stats_.ring_gate_kpt_reject = kpt_reject;
+  objects = std::move(accepted);
+
+  // 注意: 本入口"不"做 class_id 过滤, 与 get_onecandidatebox() 的行为有意不同。
+  // 它按设计返回全部候选, 由调用方自行取舍。大符旁路 detect_big() 走这里。
+
+  // 仪表: 记录(环带门后)候选[0], 与 chosen_* 语义保持一致
+  if (!objects.empty()) {
+    stats_.chosen_class_id = objects[0].class_id;
+    stats_.chosen_center = objects[0].center;
+    stats_.chosen_prob = objects[0].prob;
+  }
+
+  draw(image, objects);
+
+  /// 计算FPS
+  const float t = (cv::getTickCount() - start) / static_cast<float>(cv::getTickFrequency());
+  cv::putText(
+    image, cv::format("FPS: %.2f", 1.0 / t), cv::Point(20, 40), cv::FONT_HERSHEY_PLAIN, 2.0,
+    cv::Scalar(255, 0, 0), 2, 8);
+
+  return objects;
+}
+
+std::vector<YOLO11_BUFF::Object> YOLO11_BUFF::get_onecandidatebox(cv::Mat & image)
+{
+  const int64 start = cv::getTickCount();
+
+  if (image.empty()) {
+    tools::logger()->warn("Empty img!, camera drop!");
+    return {};
+  }
+
+  auto objects = decode(image);
+
+  /// 只在"未激活"(class_id == 0)的候选里取置信度最高的一个。
+  ///
+  /// 为什么按类别过滤, 而不是在全部候选里取最高分:
+  /// 上层 EKF 假设帧间看到的是同一片叶在连续旋转。而新模型一帧会输出多个扇叶候选
+  /// (实测最多 3 个), 单纯取最高分会让"谁分最高"在帧间任意变动, 被当作 target 的
+  /// 叶身份跟着变, roll 观测就跳 72° 的整数倍。步骤 14 实测 800 帧: 84 次整数叶位跳
+  /// 全部发生在多候选帧, 且有 136 帧(20%)选中的是已激活的叶 —— 那本就不是该打的目标。
+  ///
+  /// 按 class_id == 0 过滤能唯一确定目标: 实测每帧未激活候选恒为 1 片(667/671 = 99.4%),
+  /// 从未出现 2 片或以上, 多候选帧里多出来的全是已激活的叶。所以过滤之后不需要
+  /// tie-break, 也不需要再叠一层最近邻跟踪。下面的循环只是防御剩余的理论并列情况
+  /// (严格大于比较, 并列时取先出现的, 与 decode() 的置信度降序一致)。
+  ///
+  /// 注意: 这让三分类参与了"打哪片叶"的判定, 打破了移植设计里"三分类仅透传"的原定决策,
+  /// 已重新拍板确认。详见 docs 的 2026-09-08-step13-14-诊断.md。
+  std::vector<Object> result;
+  auto best = objects.end();
+  for (auto it = objects.begin(); it != objects.end(); ++it) {
+    if (it->class_id != 0) continue;  // 0 = 未激活, 只打这一类
+    if (best == objects.end() || it->prob > best->prob) best = it;
+  }
+
+  /// 没有未激活候选时按"无检测"处理, 返回空。
+  /// 不能退回取全场最高分 —— 那等于故意瞄准已经激活的叶。实测这种帧只有 4 / 671,
+  /// 交给上层既有的 handle_lose() 丢失状态机即可。
+  if (best != objects.end()) {
+    result.push_back(*best);
+
+    // 仪表: 记下真正交给上层的那一片叶。帧间换叶就是这个 center 在跳。
+    stats_.chosen_class_id = best->class_id;
+    stats_.chosen_center = best->center;
+    stats_.chosen_prob = best->prob;
+  }
+  draw(image, result);
+
+  /// 计算FPS
+  const float t = (cv::getTickCount() - start) / static_cast<float>(cv::getTickFrequency());
+  cv::putText(
+    image, cv::format("FPS: %.2f", 1.0 / t), cv::Point(20, 40), cv::FONT_HERSHEY_PLAIN, 2.0,
+    cv::Scalar(255, 0, 0), 2, 8);
+
+  return result;
+}
+
+void YOLO11_BUFF::convert(
+  const cv::Mat & input, cv::Mat & output, const bool normalize, const bool BGR2RGB) const
+{
+  input.convertTo(output, CV_32F);
+  if (normalize) output = output / 255.0;  // 归一化到[0, 1]
+  if (BGR2RGB) cv::cvtColor(output, output, cv::COLOR_BGR2RGB);
+}
+}  // namespace auto_buff

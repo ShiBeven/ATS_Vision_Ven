@@ -1,0 +1,128 @@
+#ifndef AUTO_BUFF__SOLVER_HPP
+#define AUTO_BUFF__SOLVER_HPP
+
+#include <yaml-cpp/yaml.h>
+
+#include <Eigen/Dense>  // 必须在opencv2/core/eigen.hpp上面
+#include <opencv2/core/eigen.hpp>
+#include <cstdint>
+#include <optional>
+#include <string>
+
+#include "buff_type.hpp"
+#include "tools/math_tools.hpp"
+namespace auto_buff
+{
+// 旋转角度
+const double THETA = 2.0 * CV_PI / 5.0;  // 2/5π
+
+class Solver
+{
+public:
+  explicit Solver(const std::string & config_path);
+
+  Eigen::Matrix3d R_gimbal2world() const;
+
+  void set_R_gimbal2world(const Eigen::Quaterniond & q);
+
+  void solve(std::optional<PowerRune> & ps) const;
+
+  // 调试用
+  cv::Point2f point_buff2pixel(cv::Point3f x);
+
+  // 用最近一次 solve() 得到的 rvec_/tvec_ 把 OBJECT_POINTS 前 4 点投影回像素,
+  // 与传入的 4 个观测角点比较, 返回 RMS 像素误差。传入点数不足 4 时返回 -1。
+  //
+  // 【重要】这个量诊断能力很弱, 不要拿它当"PnP 对不对"的判据。
+  // solve() 用 SOLVEPNP_IPPE 解 4 个共面点 —— 4 点 4 未知量, 是恰定问题,
+  // IPPE 几乎总能找到让残差趋于 0 的位姿, 哪怕:
+  //   - 4 个点根本不是同一个符叶的(帧间换叶、多候选混用)
+  //   - 点序整体旋转了 90°(此时解出一个旋转 90° 的位姿, 残差依然极小)
+  //   - 法线朝向取了错误的那一个解(二义性)
+  // 它只能查出内参严重错误或 OBJECT_POINTS 尺寸写错这类"无论如何都投不上"的问题。
+  // 判断姿态对不对要看 EKF 层的 angle 连续性, 不是看这里。
+  double reprojection_error(const std::vector<cv::Point2f> & image_points);
+
+  // r_len/c_len: 绿框人工微调参数(yaml: R_len/C_len), 默认 1.0/0.0 = 原行为。
+  //   - r_len: 缩放叶心(绿框底点, buff 系 z=0.7)到 R 标(原点)的距离;
+  //   - c_len: 圆周方向弧长偏移(m), 正值超前(沿转向), 负值滞后。
+  // 在 buff 系内先绕 x 轴(转轴)做该变换, 再走原有 world→camera 投影,
+  // 因此轴端(OBJECT_POINTS[6])始终钉在 R 标上, 整个绿框沿圆弧方向整体移动。
+  std::vector<cv::Point2f> reproject_buff(
+    const Eigen::Vector3d & xyz_in_world, double yaw, double row, double r_len = 1.0,
+    double c_len = 0.0) const;
+
+  // 诊断用: solve() 里 R 标像素被几何门挡掉、退回 4 点 PnP 的累计次数。
+  int r_gate_reject_count() const { return r_gate_reject_count_; }
+
+  // 诊断用: 最近一次 solve() 是否真的把 R 标当作第 5 个点解算。
+  bool last_solve_used_r() const { return last_solve_used_r_; }
+
+private:
+  std::string config_path_;
+  uint64_t runtime_params_version_ = 0;
+  cv::Mat camera_matrix_;
+  cv::Mat distort_coeffs_;
+  Eigen::Matrix3d R_gimbal2imubody_;
+  Eigen::Matrix3d R_camera2gimbal_;
+  Eigen::Vector3d t_camera2gimbal_;
+  Eigen::Matrix3d R_gimbal2world_;
+
+  // solve() 是 const 方法, 但这几个是"最近一次解算结果"的缓存, 语义上不属于对象的
+  // 逻辑状态, 故用 mutable。
+  // 注: 原先 solvePnP 能在 const 方法里写 rvec_/tvec_, 是因为 OpenCV 对定长类型
+  // (cv::Vec3d 属 Matx) 提供了 _OutputArray 的 const 重载; 改成直接赋值后就需要 mutable 了。
+  mutable cv::Vec3d rvec_, tvec_;
+
+  // IPPE 二义性消解用: 上一帧最终选定的旋转向量, 作为挑解时的时序参考。
+  // has_last_pose_ 为 false 时(首帧)无参考可用, 退化为取解 0 —— 即 OpenCV 按重投影
+  // 误差排序的最优解, 与改动前的行为一致。
+  mutable cv::Vec3d last_rvec_;
+  mutable bool has_last_pose_ = false;
+
+  // R 标几何门的统计, 与 rvec_ 同属"最近一次解算结果"的缓存, 故同样 mutable。
+  mutable int r_gate_reject_count_ = 0;
+  mutable bool last_solve_used_r_ = false;
+
+  // std::vector<std::vector<cv::Point3f>> OBJECT_POINTS = {
+  //   {cv::Point3f(0, 160e-3, 858.5e-3), cv::Point3f(0, -160e-3, 858.5e-3),
+  //    cv::Point3f(0, -186e-3, 541.5e-3), cv::Point3f(0, 186e-3, 541.5e-3),
+  //    cv::Point3f(0, 0, 700e-3)},
+  //   {},
+  //   {},
+  //   {},
+  //   {}};  // 单位：米
+
+  // TODO
+  // 索引语义: 0 上(827) / 1 左(700,+127) / 2 下(573) / 3 右(700,-127)
+  //          4 叶心(700) / 5 ?(220) / 6 转轴中心(0)
+  // 前 4 点与检测器重排后的 kpt 一一对应; 后 3 点只在调试重投影里用。
+  const std::vector<cv::Point3f> OBJECT_POINTS = {
+    cv::Point3f(0, 0, 827e-3), cv::Point3f(0, 127e-3, 700e-3),
+    cv::Point3f(0, 0, 573e-3), cv::Point3f(0, -127e-3, 700e-3),
+    cv::Point3f(0, 0, 700e-3), cv::Point3f(0, 0, 220e-3),
+    cv::Point3f(0, 0, 0)};  // 单位：米
+
+  // R 标像素(检测器的 raw[2])配对的物体点索引 = 6 = (0,0,0) = 转轴中心。
+  //
+  // 【为什么不是 OBJECT_POINTS[5] 的 220e-3】
+  //  1. 本文件被注释掉的原始实现自己就把 p.r_center 与 cv::Point3f(0,0,0) 配成一对
+  //     (见 buff_solver.cpp solve() 开头那段注释);
+  //  2. 物理上 R 标志的中心就是机关的转轴, 而 buff 系原点定义为转轴;
+  //  3. 220e-3 来源不明 —— 这张表头上就挂着 // TODO, 且被注释掉的更早一版表里
+  //     根本没有 R 点, 只有 5 个点(4 角 + 叶心)。它只出现在调试重投影里, 从未参与解算。
+  //
+  // 这条配对不靠推理定案: tests/auto_buff_test.cpp 里加了「R 标沿轴位置比」仪表,
+  // 直接量 R 像素落在「上→下」延长线上的位置。判据 (573-z)/254:
+  // z=0 → 2.256, z=220e-3 → 1.390。实测 median 会二选一。
+  static constexpr int R_OBJECT_INDEX = 6;
+
+  // 函数：生成绕x轴旋转的旋转矩阵
+  cv::Matx33f rotation_matrix(double angle) const;
+  void refresh_runtime_params_if_needed();
+
+  // 函数：旋转点并填充到 OBJECT_POINTS 中
+  void compute_rotated_points(std::vector<std::vector<cv::Point3f>> & object_points);
+};
+}  // namespace auto_buff
+#endif  // AUTO_AIM__SOLVER_HPP

@@ -1,0 +1,251 @@
+#include "buff_detector.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
+#include "tools/logger.hpp"
+
+namespace auto_buff
+{
+Buff_Detector::Buff_Detector(const std::string & config) : status_(LOSE), lose_(0), MODE_(config) {}
+
+// 旧的 get_r_center() / handle_img() 已删除：新模型(Rune-v8)直接输出 R 标关键点，
+// 不再需要"灰度二值化 + mask + 轮廓打分"那套靠图像处理猜 R 标的启发式。
+
+void Buff_Detector::handle_lose()
+{
+  lose_++;
+  if (lose_ >= LOSE_MAX) {
+    status_ = LOSE;
+    last_powerrune_ = std::nullopt;
+  }
+  status_ = TEM_LOSE;
+}
+
+std::optional<PowerRune> Buff_Detector::detect_24(cv::Mat & bgr_img)
+{
+  /// 模型检测
+
+  std::vector<YOLO11_BUFF::Object> results = MODE_.get_multicandidateboxes(bgr_img);
+
+  /// 处理未获得的情况
+
+  if (results.empty()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  /// results转扇叶FanBlade
+
+  std::vector<FanBlade> fanblades;
+  for (auto & result : results)
+    fanblades.emplace_back(FanBlade(result.kpt, result.center, _light));
+
+  /// 生成PowerRune。R 标与类别取置信度最高的候选(NMS 已按置信度降序输出)
+  PowerRune powerrune(fanblades, results[0].r, last_powerrune_, results[0].class_id);
+
+  /// handle error
+  if (powerrune.is_unsolve()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  status_ = TRACK;
+  lose_ = 0;
+  std::optional<PowerRune> P;
+  P.emplace(powerrune);
+  last_powerrune_ = P;
+  return P;
+}
+
+std::optional<PowerRune> Buff_Detector::detect(cv::Mat & bgr_img)
+{
+  /// 模型检测
+
+  std::vector<YOLO11_BUFF::Object> results = MODE_.get_onecandidatebox(bgr_img);
+
+  /// 处理未获得的情况
+
+  if (results.empty()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  /// results转扇叶FanBlade
+
+  std::vector<FanBlade> fanblades;
+  auto & result = results[0];
+  fanblades.emplace_back(FanBlade(result.kpt, result.center, _light));
+
+  /// 生成PowerRune。R 标由网络直出，不再外推猜测
+  PowerRune powerrune(fanblades, result.r, last_powerrune_, result.class_id);
+
+  /// handle error
+  if (powerrune.is_unsolve()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  status_ = TRACK;
+  lose_ = 0;
+  std::optional<PowerRune> P;
+  P.emplace(powerrune);
+  last_powerrune_ = P;
+  return P;
+}
+
+// ================= 大符旁路(2026-09-13) =================
+// 只被 --target=big 链路调用; 小符的 detect() 路径零改动。设计见头文件注释。
+// 帧间选叶策略: 不看置信度排第一(大符两片待打叶置信度互超), 而看
+// "哪个候选落在转子相位的 72° 槽位里"。叶身份在击中/重组时本来就会整组更换,
+// 但转子相位连续 —— 锁相位就是锁住了"同一片在转的叶"。
+// ================= 大符旁路(2026-09-13 第三轮: 身份锁定选叶) =================
+// 设计与理由见 buff_detector.hpp 的注释块。要点:
+//   锁定 → 近邻续锁(空间连续性, 不依赖 EKF 相位);
+//   熄灭 → 连续 >=2 帧找不到锁定叶才释放, 单帧掉线不切;
+//   释放后重捕获 → 默认偏下那块(相对 R 的 dy, 平局带内按置信度)。
+std::optional<PowerRune> Buff_Detector::detect_big(
+  cv::Mat & bgr_img, std::optional<double> phase_hint_rad)
+{
+  (void)phase_hint_rad;  // 相位提示不再参与选叶(自激循环根因, 见头文件注释)
+
+  std::vector<YOLO11_BUFF::Object> results = MODE_.get_multicandidateboxes(bgr_img);
+
+  if (results.empty()) {
+    handle_lose();
+    // 候选全空 ≠ 锁定叶熄灭(可能只是整帧检测掉线), 锁保持, miss 计数交给下层
+    // 连续丢失判定处理 —— 这里只累计。
+    if (big_locked_) big_lock_miss_++;
+    return std::nullopt;
+  }
+
+  // ---- R 标多候选中位数融合 ----
+  std::vector<double> rx, ry;
+  rx.reserve(results.size());
+  ry.reserve(results.size());
+  for (const auto & r : results) {
+    rx.push_back(r.r.x);
+    ry.push_back(r.r.y);
+  }
+  const auto median_of = [](std::vector<double> & v) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    if (n % 2 == 1) return v[n / 2];
+    return (v[n / 2 - 1] + v[n / 2]) * 0.5;
+  };
+  const cv::Point2f r_fused(static_cast<float>(median_of(rx)), static_cast<float>(median_of(ry)));
+
+  // ---- 选叶: 身份锁定 ----
+  auto best = results.end();
+
+  // 1) 已锁定: 近邻续锁。25fps 下大符最高转速 ~2.09 rad/s, 相邻帧叶心位移
+  //    上限 ≈ 2.09/25 × 0.7m ≈ 59mm; 9m 处像素约 6~7 px。门开 80px 与
+  //    auto_buff_test 的换叶取证阈值同量级: 同一叶单帧正常位移远小于此,
+  //    相邻叶心间距远大于此, 能干净区分"续锁"与"该换叶了"。
+  //    门内若最近的也超门(如重组瞬间), 视为本帧没找到, miss++。
+  constexpr double LOCK_MAX_JUMP_PX = 80.0;
+  if (big_locked_) {
+    double best_d = std::numeric_limits<double>::max();
+    for (auto it = results.begin(); it != results.end(); ++it) {
+      const double d = cv::norm(it->center - big_locked_center_);
+      if (d < best_d) {
+        best_d = d;
+        best = it;
+      }
+    }
+    if (best != results.end() && best_d > LOCK_MAX_JUMP_PX) {
+      best = results.end();  // 最近的都跳出了门 → 本帧没有锁定叶
+    }
+  }
+
+  // 2) 未锁定 / 锁定叶连续丢失: 释放与重捕获。
+  //    连续 >=2 帧找不到才释放锁(单帧掉线只 miss 不切, 宁可空过)。
+  if (best == results.end()) {
+    if (big_locked_) {
+      big_lock_miss_++;
+      if (big_lock_miss_ < 2) {
+        // 第 1 次丢: 可能是单帧检测抖动, 不喂叶给 EKF, 锁还没释放。
+        handle_lose();
+        return std::nullopt;
+      }
+      big_locked_ = false;  // 连续 2 帧丢 → 判熄灭, 释放锁走重捕获
+      big_lock_miss_ = 0;
+    }
+
+    // ---- 重捕获: 默认取相对 R 偏下(dy 大)的那块 ----
+    // 平局带: 两块板转到竖直轴两侧近似等高时(转一圈必然出现两次),
+    // "谁更低"由噪声决定会抖; 高度差小于带宽时改按置信度定胜负。
+    // 带宽 15px ≈ 9m 处 0.7m 臂长对应叶心高度差的 1/3, 足以覆盖关键点噪声。
+    constexpr double LOWER_TIE_BAND_PX = 15.0;
+    auto dy_of = [&](const YOLO11_BUFF::Object & o) {
+      return static_cast<double>(o.center.y - r_fused.y);
+    };
+    best = results.begin();
+    for (auto it = results.begin() + 1; it != results.end(); ++it) {
+      const double d_best = dy_of(*best), d_it = dy_of(*it);
+      if (std::abs(d_it - d_best) < LOWER_TIE_BAND_PX) {
+        if (it->prob > best->prob) best = it;  // 平局带内按置信度
+      } else if (d_it > d_best) {
+        best = it;  // 明显更低
+      }
+    }
+  }
+
+  // 3) 续锁成功清零 miss
+  if (best != results.end()) big_lock_miss_ = 0;
+
+  std::vector<FanBlade> fanblades;
+  fanblades.emplace_back(FanBlade(best->kpt, best->center, _light));
+  PowerRune powerrune(fanblades, r_fused, last_powerrune_, best->class_id);
+
+  if (powerrune.is_unsolve()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  // 4) 更新锁定状态(本帧有输出才更新, 掉线帧保持旧锁中心供近邻匹配)
+  big_locked_ = true;
+  big_locked_center_ = best->center;
+
+  status_ = TRACK;
+  lose_ = 0;
+  std::optional<PowerRune> P;
+  P.emplace(powerrune);
+  last_powerrune_ = P;
+  return P;
+}
+
+std::optional<PowerRune> Buff_Detector::detect_debug(cv::Mat & bgr_img, cv::Point2f v)
+{
+  /// 模型检测
+
+  std::vector<YOLO11_BUFF::Object> results = MODE_.get_multicandidateboxes(bgr_img);
+
+  /// 处理未获得的情况
+
+  if (results.empty()) return std::nullopt;
+
+  /// results转扇叶FanBlade
+
+  std::vector<FanBlade> fanblades_t;
+  for (auto & result : results) fanblades_t.emplace_back(FanBlade(result.kpt, result.center, _light));
+
+  /// 筛选fanblade。R 标取置信度最高的候选
+  auto r_center = results[0].r;
+  std::vector<FanBlade> fanblades;
+  for (auto & fanblade : fanblades_t) {
+    if (cv::norm((fanblade.center - r_center) - v) < 10 || results.size() == 1) {
+      fanblades.emplace_back(fanblade);
+      break;
+    }
+  }
+  if (fanblades.empty()) return std::nullopt;
+  PowerRune powerrune(fanblades, r_center, std::nullopt, results[0].class_id);
+
+  std::optional<PowerRune> P;
+  P.emplace(powerrune);
+  return P;
+}
+
+}  // namespace auto_buff

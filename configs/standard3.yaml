@@ -117,7 +117,7 @@ buff_center_dist_threshold: 100   # 中心距离NMS阈值(原图像素)
 
 #####-----buff_aimer参数-----#####
 fire_gap_time: 0.700   # s
-predict_time: 0     # s 微调预测时间，可能需要根据实际情况调整
+predict_time: 0.3     # s 微调预测时间，可能需要根据实际情况调整
 buff_predict_lead_scale: 0  # 瞄准提前量缩放(1.0=原行为; 蓝框超前过多调小; 0=无提前)
 # MPC速度/加速度前馈。验证识别层时置false只跑位置环，避免前馈的已知缺陷混淆归因
 buff_mpc_feedforward: false

@@ -47,6 +47,50 @@ public:
     int chosen_class_id = -1;    // 实际交给上层的那个候选
     cv::Point2f chosen_center{-1.f, -1.f};
     float chosen_prob = 0.f;
+
+    // ---- 环带门仪表(2026-09-13, 大符臂灯误识别问题) ----
+    // 灯臂中部的激活进度灯效(1/5~5/5)会被网络当成独立候选或把选中候选的
+    // 某个关键点拉走。装甲四角点全部落在以 R 为圆心、半径 573~827mm 的环带
+    // (r/baseline ≈ 1.97~3.26), 臂灯在 500mm 以内(≈0.87~1.97)。
+    // 候选层/关键点层各一道纯 2D 环带门, 这里只记录不改行为。
+    int ring_gate_cand_reject = 0;  // 候选中心径向比过小被拒的候选数(疑似臂灯)
+    int ring_gate_kpt_reject = 0;   // 关键点径向比越界被判无效的点数
+    int ring_gate_rescued = 0;     // 第十八轮: 被环带门拒但被锁定邻域救援放行的候选数
+    // 候选中心径向比 |center−R|/baseline, 每个候选一项, 供直方图定门限。
+    // 基线 = |top−bottom| = 254mm 物理基线, 与 R 标几何门同一归一化。
+    std::vector<float> cand_radius_ratios;
+    // 候选四角点的径向比(每候选 4 项), 定关键点层门限用。
+    std::vector<float> kpt_radius_ratios;
+    // ---- 第十五轮: 切板取证用候选全景 ----
+    // 旧 chosen_* 在多候选入口记录的是 objects[0](置信度最高), 不是 detect_big
+    // 实际选中的那片叶 —— 换叶取证量错了对象, 切板真因一直没抓到。
+    // 现在 get_multicandidateboxes 记录全部候选, detect_big 通过 mark_chosen()
+    // 标记真实选中的那个。
+    std::vector<cv::Point2f> cand_centers;  // 环带门后所有候选中心
+    std::vector<float> cand_probs;           // 对应置信度
+    std::vector<cv::Point2f> cand_rs;        // 对应 R 标(每候选各自的网络输出)
+
+    void mark_chosen(int idx, const cv::Point2f & center, float prob)
+    {
+      chosen_index = idx;
+      chosen_center = center;
+      chosen_prob = prob;
+    }
+    int chosen_index = -1;  // detect_big 真实选中候选在 cand_* 中的下标
+    // ---- 第十五轮: detect_big 锁定状态机事件(切板取证用) ----
+    // 每帧由 detect_big 写入本帧发生了什么; 环形缓冲日志在切板时把它打出来。
+    // lock_event 取值:
+    //   0 NONE      本帧无锁定相关事件
+    //   1 KEEP      续锁成功(近邻在 80px 门内)
+    //   2 MISS1     第 1 次丢(锁保持, 不喂 EKF)
+    //   3 RELEASE   连续 2 丢, 判熄灭释放锁, 记幽灵
+    //   4 GHOST_HIT 幽灵邻域找回原叶, 回锁
+    //   5 GHOST_MISS 幽灵窗内没找回(本帧仍无锁定, TTL 继续烧)
+    //   6 LOWER     幽灵耗尽/无效, 走"偏下"规则重捕获
+    //   7 COLDSTART 无幽灵的冷启动(首轮/初始化)
+    int lock_event = 0;
+    float lock_dist_px = -1.f;      // 本帧选中候选与锁定/幽灵中心的距离
+    int cand_count_raw = 0;         // 环带门前的原始候选数(含被拒的)
   };
 
   YOLO11_BUFF(const std::string & config);
@@ -58,6 +102,38 @@ public:
   std::vector<Object> get_onecandidatebox(cv::Mat & image);
 
   const DecodeStats & last_stats() const { return stats_; }
+  // 第十五轮: detect_big 选叶后回填真实选中项(多候选入口的 chosen_* 默认
+  // 记录 objects[0], 与 detect_big 的锁定选叶结果可能不同)。仅改仪表记录,
+  // 不影响检测行为; 小符 get_onecandidatebox 路径不调用。
+  void mark_chosen(const cv::Point2f & center, float prob, int class_id)
+  {
+    stats_.chosen_center = center;
+    stats_.chosen_prob = prob;
+    stats_.chosen_class_id = class_id;
+  }
+  // ---- 第十八轮: 环带门锁定邻域救援(方案四) ----
+  // 帧442 实锤: 真扇叶会被固定门限误杀(候选 0/2)。门限放宽有误收臂灯
+  // 风险, 改为"身份救援": 被环带门拒收、但中心落在锁定叶邻域(由
+  // detect_big 每帧通报)的候选放行 —— 身份由近邻锁担保, 不依赖径向比。
+  void set_ring_rescue_center(const cv::Point2f & center) { ring_rescue_center_ = center; }
+  void clear_ring_rescue() { ring_rescue_center_ = {-1.f, -1.f}; }
+  void set_lock_event(int ev, float dist_px, int cand_raw)
+  {
+    stats_.lock_event = ev;
+    stats_.lock_dist_px = dist_px;
+    stats_.cand_count_raw = cand_raw;
+  }
+  // 第十五轮补: detect_big 本帧无输出时清除选中标记, 防止测试端把
+  // objects[0](默认记录)误当实际选中的叶。仅仪表, 不影响行为。
+  void clear_chosen()
+  {
+    stats_.chosen_center = {-1.f, -1.f};
+    stats_.chosen_prob = 0.f;
+    stats_.chosen_class_id = -1;
+  }
+
+
+
 
 private:
   std::string device_;
@@ -85,6 +161,10 @@ private:
 
   DecodeStats stats_;  // 仅记录, 不参与任何判定
 
+  // 第十八轮: 锁定叶中心(detect_big 通报), 供环带门邻域救援判定。
+  // {-1,-1} = 无锁定, 救援不生效。仅多候选入口使用, 小符路径不触碰。
+  cv::Point2f ring_rescue_center_{-1.f, -1.f};
+
   // 推理 + 解码，两个公开入口共用
   std::vector<Object> decode(const cv::Mat & image);
 
@@ -99,11 +179,7 @@ private:
   // 逆变换参数写入 scale_ / pad_x_ / pad_y_
   void fill_tensor_data_image(ov::Tensor & input_tensor, const cv::Mat & input_image);
 
-  // 打印模型信息, 这个函数修改自$${OPENVINO_COMMON}/utils/src/args_helper.cpp的同名函数
-  void printInputAndOutputsInfo(const ov::Model & network);
 
-  // 将image保存为"../result/$${programName}.jpg"
-  void save(const std::string & programName, const cv::Mat & image);
 };
 }  // namespace auto_buff
 #endif

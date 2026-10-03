@@ -99,6 +99,7 @@ add_executable(auto_aim_test tests/auto_aim_test.cpp)
 add_executable(auto_aim_test_web tests/auto_aim_test_web.cpp)
 add_executable(auto_buff_test tests/auto_buff_test.cpp)
 add_executable(buff_detect_video_test tests/buff_detect_video_test.cpp)
+add_executable(buff_record tests/buff_record.cpp)
 add_executable(camera_detect_test tests/camera_detect_test.cpp)
 add_executable(camera_test tests/camera_test.cpp)
 add_executable(camera_thread_test tests/camera_thread_test.cpp)
@@ -117,6 +118,7 @@ target_link_libraries(auto_aim_test ${OpenCV_LIBS} fmt::fmt yaml-cpp tools io au
 target_link_libraries(auto_aim_test_web ${OpenCV_LIBS} fmt::fmt yaml-cpp tools debug_visualization io auto_aim auto_buff)
 target_link_libraries(auto_buff_test ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_buff tools io)
 target_link_libraries(buff_detect_video_test ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_buff tools io)
+target_link_libraries(buff_record ${OpenCV_LIBS} fmt::fmt yaml-cpp auto_buff tools io)
 target_link_libraries(camera_detect_test ${OpenCV_LIBS} fmt::fmt yaml-cpp tools auto_aim io)
 target_link_libraries(camera_test ${OpenCV_LIBS} fmt::fmt tools io)
 target_link_libraries(camera_thread_test ${OpenCV_LIBS} fmt::fmt auto_aim tools io)
@@ -147,6 +149,7 @@ list(APPEND SP_VISION_RUNTIME_TARGETS
   auto_aim_test_web
   auto_buff_test
   buff_detect_video_test
+  buff_record
   camera_detect_test
   camera_test
   camera_thread_test

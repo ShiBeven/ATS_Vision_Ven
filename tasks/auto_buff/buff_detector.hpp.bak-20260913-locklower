@@ -1,0 +1,54 @@
+#ifndef AUTO_BUFF__TRACK_HPP
+#define AUTO_BUFF__TRACK_HPP
+
+#include <yaml-cpp/yaml.h>
+
+#include <deque>
+#include <optional>
+
+#include "buff_type.hpp"
+#include "tools/img_tools.hpp"
+#include "yolo11_buff.hpp"
+const int LOSE_MAX = 20;  // 丢失的阙值
+namespace auto_buff
+{
+class Buff_Detector
+{
+public:
+  Buff_Detector(const std::string & config);
+
+  std::optional<PowerRune> detect_24(cv::Mat & bgr_img);
+
+  std::optional<PowerRune> detect(cv::Mat & bgr_img);
+
+  // 大符旁路(2026-09-13): 与 detect() 并存, 只被 --target=big 的测试/生产链路调用。
+  // 小符链路继续走 detect(), 行为零改动。
+  //
+  // 大符规则: 单次同时点亮 2 块装甲。双目标帧间置信度互超 → 若沿用"取最高分"
+  // 选中叶身份乱跳, roll 观测 72° 整数倍跳变污染 spd/a/ω/φ。
+  // 本旁路改用"预测相位 + 72° 槽位"归位选叶:
+  //   1. 多候选全量上抛(不做 class 过滤 —— 大符待打叶的 class 语义尚未用录像验证,
+  //      阶段 0 仪表先量, 量完再定, 这里不预设);
+  //   2. R 标取全部候选的中位数(全局定点, 多候选融合比单候选稳);
+  //   3. 每个候选叶心角与 EKF 上一帧 roll 预测的槽位角差 < π/5 才有效,
+  //      有效候选中取置信度最高的一片交给上层 —— 这与"取全场最高分"不同,
+  //      换叶/重组时相位连续, 选中的始终是同一片在转的叶。
+  // 参数 phase_hint_rad: 上层(BigTarget::ekf_x()[5])给的当前转子相位预测;
+  //   nullopt = 无相位可用(首帧), 退化为最高分(与旧行为一致, 供冷启动)。
+  std::optional<PowerRune> detect_big(
+    cv::Mat & bgr_img, std::optional<double> phase_hint_rad);
+
+  std::optional<PowerRune> detect_debug(cv::Mat & bgr_img, cv::Point2f v);
+  // 透出上一帧的候选统计, 供离线诊断读取。只读, 不影响检测行为。
+  const YOLO11_BUFF::DecodeStats & last_decode_stats() const { return MODE_.last_stats(); }
+
+private:
+  void handle_lose();
+
+  YOLO11_BUFF MODE_;
+  Track_status status_;
+  int lose_;  // 丢失的次数
+  std::optional<PowerRune> last_powerrune_ = std::nullopt;
+};
+}  // namespace auto_buff
+#endif  // DETECTOR_HPP

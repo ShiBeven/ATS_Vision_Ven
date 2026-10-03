@@ -1,0 +1,211 @@
+#include "buff_detector.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
+#include "tools/logger.hpp"
+
+namespace auto_buff
+{
+Buff_Detector::Buff_Detector(const std::string & config) : status_(LOSE), lose_(0), MODE_(config) {}
+
+// 旧的 get_r_center() / handle_img() 已删除：新模型(Rune-v8)直接输出 R 标关键点，
+// 不再需要"灰度二值化 + mask + 轮廓打分"那套靠图像处理猜 R 标的启发式。
+
+void Buff_Detector::handle_lose()
+{
+  lose_++;
+  if (lose_ >= LOSE_MAX) {
+    status_ = LOSE;
+    last_powerrune_ = std::nullopt;
+  }
+  status_ = TEM_LOSE;
+}
+
+std::optional<PowerRune> Buff_Detector::detect_24(cv::Mat & bgr_img)
+{
+  /// 模型检测
+
+  std::vector<YOLO11_BUFF::Object> results = MODE_.get_multicandidateboxes(bgr_img);
+
+  /// 处理未获得的情况
+
+  if (results.empty()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  /// results转扇叶FanBlade
+
+  std::vector<FanBlade> fanblades;
+  for (auto & result : results)
+    fanblades.emplace_back(FanBlade(result.kpt, result.center, _light));
+
+  /// 生成PowerRune。R 标与类别取置信度最高的候选(NMS 已按置信度降序输出)
+  PowerRune powerrune(fanblades, results[0].r, last_powerrune_, results[0].class_id);
+
+  /// handle error
+  if (powerrune.is_unsolve()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  status_ = TRACK;
+  lose_ = 0;
+  std::optional<PowerRune> P;
+  P.emplace(powerrune);
+  last_powerrune_ = P;
+  return P;
+}
+
+std::optional<PowerRune> Buff_Detector::detect(cv::Mat & bgr_img)
+{
+  /// 模型检测
+
+  std::vector<YOLO11_BUFF::Object> results = MODE_.get_onecandidatebox(bgr_img);
+
+  /// 处理未获得的情况
+
+  if (results.empty()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  /// results转扇叶FanBlade
+
+  std::vector<FanBlade> fanblades;
+  auto & result = results[0];
+  fanblades.emplace_back(FanBlade(result.kpt, result.center, _light));
+
+  /// 生成PowerRune。R 标由网络直出，不再外推猜测
+  PowerRune powerrune(fanblades, result.r, last_powerrune_, result.class_id);
+
+  /// handle error
+  if (powerrune.is_unsolve()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  status_ = TRACK;
+  lose_ = 0;
+  std::optional<PowerRune> P;
+  P.emplace(powerrune);
+  last_powerrune_ = P;
+  return P;
+}
+
+// ================= 大符旁路(2026-09-13) =================
+// 只被 --target=big 链路调用; 小符的 detect() 路径零改动。设计见头文件注释。
+// 帧间选叶策略: 不看置信度排第一(大符两片待打叶置信度互超), 而看
+// "哪个候选落在转子相位的 72° 槽位里"。叶身份在击中/重组时本来就会整组更换,
+// 但转子相位连续 —— 锁相位就是锁住了"同一片在转的叶"。
+std::optional<PowerRune> Buff_Detector::detect_big(
+  cv::Mat & bgr_img, std::optional<double> phase_hint_rad)
+{
+  std::vector<YOLO11_BUFF::Object> results = MODE_.get_multicandidateboxes(bgr_img);
+
+  if (results.empty()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  // ---- R 标多候选中位数融合 ----
+  // 全局定点, 所有候选看到的应是同一个 R。中位数抗离群(某一片叶的 R 关键点
+  // 置信度低时可能乱飘)。候选 <= 2 个时退化为均值, 与单候选旧行为接近。
+  std::vector<double> rx, ry;
+  rx.reserve(results.size());
+  ry.reserve(results.size());
+  for (const auto & r : results) {
+    rx.push_back(r.r.x);
+    ry.push_back(r.r.y);
+  }
+  const auto median_of = [](std::vector<double> & v) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    if (n % 2 == 1) return v[n / 2];
+    return (v[n / 2 - 1] + v[n / 2]) * 0.5;
+  };
+  const cv::Point2f r_fused(static_cast<float>(median_of(rx)), static_cast<float>(median_of(ry)));
+
+  // ---- 相位槽位归位选叶 ----
+  // 候选叶心角(相对融合 R)与 phase_hint 的差, 折到 [−π, π) 后找最近 72° 槽位。
+  // |折角| < π/5(36°) 才算有效候选 —— 与 PowerRune 叶位窗一致。
+  // 有效候选取置信度最高; 全部无效(重组瞬间/相位预测失准)退化为全场最高分,
+  // 交给 BigTarget::update 的跳变对齐把 roll 拉回最近 72° 倍数。
+  auto slot_err = [&](const cv::Point2f & center) -> std::optional<double> {
+    if (!phase_hint_rad.has_value()) return std::nullopt;
+    const double ang = std::atan2(
+      static_cast<double>(center.y - r_fused.y), static_cast<double>(center.x - r_fused.x));
+    double d = ang - *phase_hint_rad;
+    // 折到 (−π/5, π/5]: 选最近 72° 槽位
+    const double slot = 2.0 * CV_PI / 5.0;
+    d = std::fmod(d, slot);
+    if (d > slot / 2.0) d -= slot;
+    if (d <= -slot / 2.0) d += slot;
+    return d;
+  };
+
+  auto best = results.end();
+  if (phase_hint_rad.has_value()) {
+    for (auto it = results.begin(); it != results.end(); ++it) {
+      const auto d = slot_err(it->center);
+      if (!d.has_value() || std::abs(*d) > CV_PI / 5.0) continue;
+      if (best == results.end() || it->prob > best->prob) best = it;
+    }
+  }
+  if (best == results.end()) {
+    // 无相位提示或全部候选都不在任何合理槽位: 退化取最高分(NMS 输出已按
+    // 置信度降序, results[0] 即最高分), 保持链路不断流。
+    best = results.begin();
+  }
+
+  std::vector<FanBlade> fanblades;
+  fanblades.emplace_back(FanBlade(best->kpt, best->center, _light));
+  PowerRune powerrune(fanblades, r_fused, last_powerrune_, best->class_id);
+
+  if (powerrune.is_unsolve()) {
+    handle_lose();
+    return std::nullopt;
+  }
+
+  status_ = TRACK;
+  lose_ = 0;
+  std::optional<PowerRune> P;
+  P.emplace(powerrune);
+  last_powerrune_ = P;
+  return P;
+}
+std::optional<PowerRune> Buff_Detector::detect_debug(cv::Mat & bgr_img, cv::Point2f v)
+{
+  /// 模型检测
+
+  std::vector<YOLO11_BUFF::Object> results = MODE_.get_multicandidateboxes(bgr_img);
+
+  /// 处理未获得的情况
+
+  if (results.empty()) return std::nullopt;
+
+  /// results转扇叶FanBlade
+
+  std::vector<FanBlade> fanblades_t;
+  for (auto & result : results) fanblades_t.emplace_back(FanBlade(result.kpt, result.center, _light));
+
+  /// 筛选fanblade。R 标取置信度最高的候选
+  auto r_center = results[0].r;
+  std::vector<FanBlade> fanblades;
+  for (auto & fanblade : fanblades_t) {
+    if (cv::norm((fanblade.center - r_center) - v) < 10 || results.size() == 1) {
+      fanblades.emplace_back(fanblade);
+      break;
+    }
+  }
+  if (fanblades.empty()) return std::nullopt;
+  PowerRune powerrune(fanblades, r_center, std::nullopt, results[0].class_id);
+
+  std::optional<PowerRune> P;
+  P.emplace(powerrune);
+  return P;
+}
+
+}  // namespace auto_buff

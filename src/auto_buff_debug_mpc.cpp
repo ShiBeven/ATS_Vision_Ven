@@ -21,17 +21,24 @@
 // 定义命令行参数
 const std::string keys =
   "{help h usage ? | | 输出命令行参数说明}"
-  "{@config-path   |  configs/standard3.yaml | yaml配置文件路径 }";
+  "{@config-path   |  configs/standard3.yaml | yaml配置文件路径 }"
+  "{target        | small | 目标类型: small=小符(detect), big=大符(detect_big) }";
 
 int main(int argc, char * argv[])
 {
   // 读取命令行参数
   cv::CommandLineParser cli(argc, argv, keys);
   auto config_path = cli.get<std::string>(0);
+  const std::string target_type = cli.get<std::string>("target");
   if (cli.has("help") || config_path.empty()) {
     cli.printMessage();
     return 0;
   }
+  if (target_type != "small" && target_type != "big") {
+    tools::logger()->error("--target 只能是 small 或 big, 收到: {}", target_type);
+    return 1;
+  }
+  const bool use_big_detect = (target_type == "big");
 
   // 初始化绘图器、录制器、退出器
   tools::Plotter plotter;
@@ -45,7 +52,8 @@ int main(int argc, char * argv[])
   // 初始化识别器、解算器、追踪器、瞄准器
   auto_buff::Buff_Detector detector(config_path);
   auto_buff::Solver solver(config_path);
-  auto_buff::SmallTarget target;
+  auto_buff::SmallTarget small_target;
+  auto_buff::BigTarget big_target;
   auto_buff::Aimer aimer(config_path);
 
   cv::Mat img;
@@ -62,15 +70,36 @@ int main(int argc, char * argv[])
 
     solver.set_R_gimbal2world(q);
 
-    auto power_runes = detector.detect(img);
+    // 小符: 原 detect() 单候选, 行为零改动; 大符: detect_big() 多候选+身份锁定
+    // (与测试链路同一套)。phase_hint 当前不参与选叶(接口保留), 传上一帧 EKF
+    // 转子相位, 未解算时 nullopt。
+    std::optional<auto_buff::PowerRune> power_runes;
+    if (use_big_detect) {
+      std::optional<double> phase_hint;
+      if (!big_target.is_unsolve() && big_target.ekf_x().size() > 5)
+        phase_hint = big_target.ekf_x()[5];
+      power_runes = detector.detect_big(img, phase_hint);
+    } else {
+      power_runes = detector.detect(img);
+    }
 
     solver.solve(power_runes);
 
-    target.get_target(power_runes, t);
+    // 统一走基类指针: 小符恒 SmallTarget, 大符恒 BigTarget, EKF 状态由各自对象持有
+    auto_buff::Target * target =
+      use_big_detect ? static_cast<auto_buff::Target *>(&big_target)
+                     : static_cast<auto_buff::Target *>(&small_target);
+    target->get_target(power_runes, t);
 
-    auto target_copy = target;
+    // 副本化(与测试链路同构): aim 的前瞻 predict 只推副本, 真身 EKF 不吃 predict。
+    // 三目两分支类型不同不能直接推 auto, 故各留一份副本, 用基类指针统一喂给 aimer。
+    auto small_copy = small_target;
+    auto big_copy = big_target;
+    auto_buff::Target * target_copy =
+      use_big_detect ? static_cast<auto_buff::Target *>(&big_copy)
+                     : static_cast<auto_buff::Target *>(&small_copy);
 
-    auto plan = aimer.mpc_aim(target_copy, t, gs, true);
+    auto plan = aimer.mpc_aim(*target_copy, t, gs, true);
 
     gimbal.send(
       plan.control, plan.fire, plan.yaw, plan.yaw_vel, plan.yaw_acc, plan.pitch, plan.pitch_vel,
@@ -91,7 +120,7 @@ int main(int argc, char * argv[])
       data["buff_class_id"] = p.class_id;  // 0 未激活 / 1 小符已激活 / 2 大符已激活, 仅观察用
     }
 
-    if (!target.is_unsolve()) {
+    if (!target->is_unsolve()) {
       auto & p = power_runes.value();
 
       // 显示
@@ -116,9 +145,9 @@ int main(int argc, char * argv[])
       // 绿色 = 当前帧 EKF 状态重投影, 应当贴合扇叶
       // R_len/C_len 在这里生效: 径向缩放 + 圆周偏移, 轴端仍钉在 R 标上,
       // 与瞄准点(buff_aimer.cpp 的 aim_point_in_world)是同一套参数。
-      auto Rxyz_in_world_now = target.point_buff2world(Eigen::Vector3d(0.0, 0.0, 0.0));
+      auto Rxyz_in_world_now = target->point_buff2world(Eigen::Vector3d(0.0, 0.0, 0.0));
       auto image_points = solver.reproject_buff(
-        Rxyz_in_world_now, target.ekf_x()[4], target.ekf_x()[5], aimer.R_len(), aimer.C_len());
+        Rxyz_in_world_now, target->ekf_x()[4], target->ekf_x()[5], aimer.R_len(), aimer.C_len());
       tools::draw_points(
         img, std::vector<cv::Point2f>(image_points.begin(), image_points.begin() + 4), {0, 255, 0});
       cv::line(img, image_points[4], image_points[6], {0, 255, 0}, 1, cv::LINE_AA);
@@ -126,9 +155,9 @@ int main(int argc, char * argv[])
       const cv::Point2f green_blade = image_points[4];
 
       // 蓝色 = 预测(超前)位置重投影, 应当沿旋转方向领先绿框
-      auto Rxyz_in_world_pre = target_copy.point_buff2world(Eigen::Vector3d(0.0, 0.0, 0.0));
+      auto Rxyz_in_world_pre = target_copy->point_buff2world(Eigen::Vector3d(0.0, 0.0, 0.0));
       image_points = solver.reproject_buff(
-        Rxyz_in_world_pre, target_copy.ekf_x()[4], target_copy.ekf_x()[5], aimer.R_len(),
+        Rxyz_in_world_pre, target_copy->ekf_x()[4], target_copy->ekf_x()[5], aimer.R_len(),
         aimer.C_len());
       tools::draw_points(
         img, std::vector<cv::Point2f>(image_points.begin(), image_points.begin() + 4), {255, 0, 0});
@@ -153,7 +182,7 @@ int main(int argc, char * argv[])
       }
 
       // 观测器内部数据
-      Eigen::VectorXd x = target.ekf_x();
+      Eigen::VectorXd x = target->ekf_x();
       data["R_yaw"] = x[0];
       data["R_V_yaw"] = x[1];
       data["R_pitch"] = x[2];
@@ -162,12 +191,13 @@ int main(int argc, char * argv[])
 
       data["angle"] = x[5] * 57.3;
       data["spd"] = x[6] * 57.3;
-      if (x.size() >= 10) {
+      if (x.size() >= 11) {  // 大符 11 态: spd = a·sin(ωt+φ) + b, b=x[10]
         data["spd"] = x[6];
         data["a"] = x[7];
         data["w"] = x[8];
         data["fi"] = x[9];
-        data["spd0"] = target.spd;
+        data["b"] = x[10];
+        data["spd0"] = target->spd;
       }
     }
 

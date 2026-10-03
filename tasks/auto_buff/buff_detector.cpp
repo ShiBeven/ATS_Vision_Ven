@@ -1,5 +1,10 @@
 #include "buff_detector.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>  // 第十四轮: ghost lock 用 numeric_limits
+#include <vector>
+
 #include "tools/logger.hpp"
 
 namespace auto_buff
@@ -24,6 +29,7 @@ std::optional<PowerRune> Buff_Detector::detect_24(cv::Mat & bgr_img)
   /// 模型检测
 
   std::vector<YOLO11_BUFF::Object> results = MODE_.get_multicandidateboxes(bgr_img);
+  const int cand_count_raw = MODE_.last_stats().cand_count_raw;  // 本帧 NMS 前候选数
 
   /// 处理未获得的情况
 
@@ -91,6 +97,192 @@ std::optional<PowerRune> Buff_Detector::detect(cv::Mat & bgr_img)
   return P;
 }
 
+// ================= 大符旁路(2026-09-13) =================
+// 只被 --target=big 链路调用; 小符的 detect() 路径零改动。设计见头文件注释。
+// 帧间选叶策略: 不看置信度排第一(大符两片待打叶置信度互超), 而看
+// "哪个候选落在转子相位的 72° 槽位里"。叶身份在击中/重组时本来就会整组更换,
+// 但转子相位连续 —— 锁相位就是锁住了"同一片在转的叶"。
+// ================= 大符旁路(2026-09-13 第三轮: 身份锁定选叶) =================
+// 设计与理由见 buff_detector.hpp 的注释块。要点:
+//   锁定 → 近邻续锁(空间连续性, 不依赖 EKF 相位);
+//   熄灭 → 连续 >=2 帧找不到锁定叶才释放, 单帧掉线不切;
+//   释放后重捕获 → 默认偏下那块(相对 R 的 dy, 平局带内按置信度)。
+std::optional<PowerRune> Buff_Detector::detect_big(
+  cv::Mat & bgr_img, std::optional<double> phase_hint_rad)
+{
+  // ---- 第十八轮: 环带门锁定邻域救援通报 ----
+  // 在 decode(环带门在 get_multicandidateboxes 内)之前告知锁中心:
+  // 有锁 → 被门误杀的锁定叶可被身份救援放行(见 yolo11_buff.cpp 注释);
+  // 无锁/释放 → 清除, 救援不生效(此时没有身份担保, 门限回到保守)。
+  // 注意顺序: 本帧锁状态用的是上一帧结果(锁中心在上一帧末已更新),
+  // 这正是救援语义 —— "上一帧还锁在这片叶上, 这帧它被门误杀了"。
+  if (big_locked_)
+    MODE_.set_ring_rescue_center(big_locked_center_);
+  else
+    MODE_.clear_ring_rescue();
+
+  std::vector<YOLO11_BUFF::Object> results = MODE_.get_multicandidateboxes(bgr_img);
+  const int cand_count_raw = MODE_.last_stats().cand_count_raw;  // 本帧 NMS 前候选数
+
+  if (results.empty()) {
+    handle_lose();
+    // 候选全空 ≠ 锁定叶熄灭(可能只是整帧检测掉线), 锁保持, miss 计数交给下层
+    // 连续丢失判定处理 —— 这里只累计。
+    if (big_locked_) {
+      big_lock_miss_++;
+      MODE_.set_lock_event(2, -1.f, cand_count_raw);  // MISS1 语义: 本帧无检测
+    } else {
+      MODE_.set_lock_event(0, -1.f, cand_count_raw);
+    }
+    clear_big_choice();  // 第十五轮补: 无输出, 清除选中标记
+    return std::nullopt;
+  }
+
+  // ---- R 标多候选中位数融合 ----
+  std::vector<double> rx, ry;
+  rx.reserve(results.size());
+  ry.reserve(results.size());
+  for (const auto & r : results) {
+    rx.push_back(r.r.x);
+    ry.push_back(r.r.y);
+  }
+  const auto median_of = [](std::vector<double> & v) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    if (n % 2 == 1) return v[n / 2];
+    return (v[n / 2 - 1] + v[n / 2]) * 0.5;
+  };
+  const cv::Point2f r_fused(static_cast<float>(median_of(rx)), static_cast<float>(median_of(ry)));
+
+  // ---- 选叶: 身份锁定 ----
+  auto best = results.end();
+
+  // 1) 已锁定: 近邻续锁。97fps 下大符最高转速 ~2.09 rad/s, 相邻帧叶心位移
+  //    上限 ≈ 2.09/97 × 0.7m ≈ 15mm; 9m 处像素约 1.5 px。门开 80px:
+  //    同一叶正常位移远小于此, 相邻叶心间距远大于此, 能干净区分续锁与换叶。
+  //    门内若最近的也超门(如重组瞬间), 视为本帧没找到, miss++。
+  constexpr double LOCK_MAX_JUMP_PX = 80.0;
+  float keep_dist = -1.f;
+  if (big_locked_) {
+    double best_d = std::numeric_limits<double>::max();
+    for (auto it = results.begin(); it != results.end(); ++it) {
+      const double d = cv::norm(it->center - big_locked_center_);
+      if (d < best_d) {
+        best_d = d;
+        best = it;
+      }
+    }
+    if (best != results.end()) keep_dist = static_cast<float>(best_d);
+    if (best != results.end() && best_d > LOCK_MAX_JUMP_PX) {
+      best = results.end();  // 最近的都跳出了门 → 本帧没有锁定叶
+      keep_dist = static_cast<float>(best_d);  // 记录超门距离, 取证用
+    }
+  }
+
+  // 2) 未锁定 / 锁定叶连续丢失: 释放与重捕获。
+  //    连续 >=2 帧找不到才释放锁(单帧掉线只 miss 不切, 宁可空过)。
+  int lock_event_now = 0;
+  if (best == results.end()) {
+    if (big_locked_) {
+      big_lock_miss_++;
+      if (big_lock_miss_ < 2) {
+        // 第 1 次丢: 可能是单帧检测抖动, 不喂叶给 EKF, 锁还没释放。
+        MODE_.set_lock_event(2, keep_dist, cand_count_raw);
+        clear_big_choice();  // 第十五轮补
+        handle_lose();
+        return std::nullopt;
+      }
+      big_locked_ = false;  // 连续 2 帧丢 → 判熄灭, 释放锁走重捕获
+      big_lock_miss_ = 0;
+      big_ghost_center_ = big_locked_center_;  // 第十四轮: 记幽灵
+      big_ghost_ttl_ = 8;                      // ~83ms @ 97fps
+      lock_event_now = 3;                      // RELEASE
+    }
+
+    // ---- 重捕获 ----
+    // 第一优先: 幽灵锁邻域。TTL 内原叶若重新被检测到, 必然还在释放时的
+    // 位置附近(8 帧内转角 <10 度); B 板转开已超过半个叶位, 不会误进此门。
+    // 门 60px 比续锁门 80px 略紧: 幽灵期间没有观测刷新位置, 转子又在动,
+    // 门太大可能吸到相邻叶; 60px 仍远大于单帧位移(~4px @ 97fps)。
+    constexpr double GHOST_RECAPTURE_PX = 60.0;
+    if (big_ghost_ttl_ > 0) {
+      double ghost_d = std::numeric_limits<double>::max();
+      auto ghost_best = results.end();
+      for (auto it = results.begin(); it != results.end(); ++it) {
+        const double d = cv::norm(it->center - big_ghost_center_);
+        if (d < ghost_d) {
+          ghost_d = d;
+          ghost_best = it;
+        }
+      }
+      big_ghost_ttl_--;  // 每帧递减, 无论本帧是否找回
+      if (ghost_best != results.end() && ghost_d < GHOST_RECAPTURE_PX) {
+        // 找回原叶: 直接回锁, 不走偏下规则。幽灵清除。
+        best = ghost_best;
+        big_ghost_ttl_ = 0;
+        lock_event_now = 4;  // GHOST_HIT
+        keep_dist = static_cast<float>(ghost_d);
+      } else if (best == results.end()) {
+        lock_event_now = 5;  // GHOST_MISS
+        keep_dist = static_cast<float>(ghost_d);
+      }
+    }
+
+    // 第二优先(幽灵无效/耗尽): 原规则 —— 相对 R 偏下的那块。
+    // 平局带: 两块板转到竖直轴两侧近似等高时(转一圈必然出现两次),
+    // "谁更低"由噪声决定会抖; 高度差小于带宽时改按置信度定胜负。
+    // 带宽 15px ≈ 9m 处 0.7m 臂长对应叶心高度差的 1/3, 足以覆盖关键点噪声。
+    if (best == results.end()) {
+      if (big_ghost_ttl_ <= 0 && lock_event_now != 5)
+        lock_event_now = (big_ghost_center_.x >= 0 ? 6 : 7);  // LOWER / COLDSTART
+      constexpr double LOWER_TIE_BAND_PX = 15.0;
+      auto dy_of = [&](const YOLO11_BUFF::Object & o) {
+        return static_cast<double>(o.center.y - r_fused.y);
+      };
+      best = results.begin();
+      for (auto it = results.begin() + 1; it != results.end(); ++it) {
+        const double d_best = dy_of(*best), d_it = dy_of(*it);
+        if (std::abs(d_it - d_best) < LOWER_TIE_BAND_PX) {
+          if (it->prob > best->prob) best = it;  // 平局带内按置信度
+        } else if (d_it > d_best) {
+          best = it;  // 明显更低
+        }
+      }
+    }
+  } else {
+    lock_event_now = 1;  // KEEP
+  }
+
+  // 3) 续锁成功清零 miss
+  if (best != results.end()) big_lock_miss_ = 0;
+
+  std::vector<FanBlade> fanblades;
+  fanblades.emplace_back(FanBlade(best->kpt, best->center, _light));
+  PowerRune powerrune(fanblades, r_fused, last_powerrune_, best->class_id);
+
+  if (powerrune.is_unsolve()) {
+    handle_lose();
+    MODE_.set_lock_event(lock_event_now, keep_dist, cand_count_raw);
+    clear_big_choice();  // 第十五轮补
+    return std::nullopt;
+  }
+
+  // 4) 更新锁定状态(本帧有输出才更新, 掉线帧保持旧锁中心供近邻匹配)
+  big_locked_ = true;
+  big_locked_center_ = best->center;
+  big_ghost_ttl_ = 0;  // 已重新锁定, 幽灵使命完成
+
+  // 第十五轮: 回填真实选中项 + 状态机事件(取证日志消费)
+  report_big_choice(
+    best->center, best->prob, best->class_id, lock_event_now, keep_dist, cand_count_raw);
+
+  status_ = TRACK;
+  lose_ = 0;
+  std::optional<PowerRune> P;
+  P.emplace(powerrune);
+  last_powerrune_ = P;
+  return P;
+}
 std::optional<PowerRune> Buff_Detector::detect_debug(cv::Mat & bgr_img, cv::Point2f v)
 {
   /// 模型检测

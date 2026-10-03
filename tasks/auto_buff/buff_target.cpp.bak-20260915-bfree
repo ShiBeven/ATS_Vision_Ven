@@ -1,0 +1,1014 @@
+#include "buff_target.hpp"
+
+#include <algorithm>  // std::clamp(第七轮 ω 硬夹)
+#include <limits>
+
+namespace auto_buff
+{
+///voter
+
+Voter::Voter() : clockwise_(0) {}
+
+void Voter::vote(const double angle_last, const double angle_now)
+{
+  if (std::abs(clockwise_) > 50) return;
+  if (angle_last > angle_now)
+    clockwise_--;
+  else
+    clockwise_++;
+}
+
+int Voter::clockwise() const { return clockwise_ > 0 ? 1 : -1; }
+
+/// Target
+
+Target::Target() : first_in_(true), unsolvable_(true) {};
+
+Eigen::Vector3d Target::point_buff2world(const Eigen::Vector3d & point_in_buff) const
+{
+  if (unsolvable_) return Eigen::Vector3d(0, 0, 0);
+  Eigen::Matrix3d R_buff2world =
+    tools::rotation_matrix(Eigen::Vector3d(ekf_.x[4], 0.0, ekf_.x[5]));  // pitch = 0
+
+  auto R_yaw = ekf_.x[0];
+  auto R_pitch = ekf_.x[2];
+  auto R_dis = ekf_.x[3];
+  Eigen::Vector3d point_in_world =
+    R_buff2world * point_in_buff + Eigen::Vector3d(
+                                     R_dis * std::cos(R_pitch) * std::cos(R_yaw),
+                                     R_dis * std::cos(R_pitch) * std::sin(R_yaw),
+                                     R_dis * std::sin(R_pitch));
+  return point_in_world;
+}
+
+bool Target::is_unsolve() const { return unsolvable_; }
+
+Eigen::VectorXd Target::ekf_x() const { return ekf_.x; }
+
+Eigen::VectorXd Target::ekf_P_diag() const
+{
+  if (ekf_.P.size() == 0) return Eigen::VectorXd();
+  return ekf_.P.diagonal();
+}
+
+/// SmallTarget
+
+SmallTarget::SmallTarget() : Target() {}
+
+void SmallTarget::get_target(
+  const std::optional<PowerRune> & p, std::chrono::steady_clock::time_point & timestamp)
+{
+  // 如果没有识别，退出函数
+  static int lost_cn = 0;
+  if (!p.has_value()) {
+    unsolvable_ = true;
+    lost_cn++;
+    return;
+  }
+
+  static std::chrono::steady_clock::time_point start_timestamp = timestamp;
+  auto time_gap = tools::delta_time(timestamp, start_timestamp);
+
+  // init
+  if (first_in_) {
+    unsolvable_ = true;
+    init(time_gap, p.value());
+    first_in_ = false;
+  }
+
+  // 处理识别时间间隔过大
+  if (lost_cn > 6) {
+    unsolvable_ = true;
+    tools::logger()->debug("[Target] 丢失buff");
+    lost_cn = 0;
+    first_in_ = true;
+    return;
+  }
+
+  // kalman update
+  unsolvable_ = false;
+  update(time_gap, p.value());
+
+  // 处理发散: 只防真离谱, 不再假设转速值。
+  // 原门 [SMALL_W-10, SMALL_W+10] deg/s 把 "小符必为 60" 写死 ——
+  // 录像真实 ~120 deg/s 时 spd 每次爬到 70 就被判发散踢回 60, 周期性重初始化,
+  // 这就是绿框周期性跳变的另一半来源。转速真值应由滤波器从观测学出
+  // (见 predict 里 spd 过程噪声), 不该由门预设。
+  // 上界 4 rad/s (~229 deg/s) 防数值发散; 下界防转速贴零(EKF 已无跟踪能力)。
+  if (std::abs(ekf_.x[6]) > 4.0 || std::abs(ekf_.x[6]) < CV_PI / 36) {
+    unsolvable_ = true;
+    tools::logger()->debug("[Target] 小符角度发散spd: {:.2f}", ekf_.x[6] * 180 / CV_PI);
+    first_in_ = true;
+    return;
+  }
+}
+
+void SmallTarget::predict(double dt)
+{
+  // 预测下一个状态
+  // clang-format off
+  A_ << 1.0,  dt, 0.0, 0.0, 0.0, 0.0, 0.0, // R_yaw
+        0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, // R_v_yaw
+        0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, // R_pitch
+        0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, // R_dis
+        0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, // yaw
+        0.0, 0.0, 0.0, 0.0, 0.0, 1.0,  dt, // roll
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0; // spd
+
+  // 过程噪声协方差矩阵                            //// 调整
+  auto v1 = 0.001;  // 角加速度方差
+  auto a = dt * dt * dt * dt / 4;
+  auto b = dt * dt * dt / 2;
+  auto c = dt * dt;
+    // spd 过程噪声: 转轴锁死后 roll 观测已干净, spd 完全可观。原先为 0,
+  // P[6][6] 单调衰减, 增益消失, spd 冻死在初值 60, 而录像真实转速 ~120 deg/s,
+  // 每帧残差 1.24 deg 累积成绿框滞后, 到 36 deg 触发 72 deg 整叶位跳变(超调到 +36),
+  // 再落后再跳 —— 就是画面上落后-跳到叶上-循环的机理。
+  // spd 过程噪声: 小符转速规则恒定(~60 deg/s), 只需慢速跟踪。
+  // 曾用 0.25(sigma=29 deg/s), 结果关键点噪声逐帧推得动 spd,
+  // spd 在 55~81 deg/s 振荡, 蓝框夹角(=spd*T)随之摆动十几度。
+  // 0.01(sigma=5.7 deg/s): 单帧噪声推不动, 几十帧内仍能跟上真实漂移。
+  constexpr double SPD_PROCESS_VAR = 0.01;  // (0.1 rad/s)^2
+  Q_ << a * v1, b * v1, 0.0, 0.0, 0.0, 0.0, 0.0,
+        b * v1, c * v1, 0.0, 0.0, 0.0, 0.0, 0.0,
+           0.0,    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+           0.0,    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+           0.0,    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+           0.0,    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+           0.0,    0.0, 0.0, 0.0, 0.0, 0.0, SPD_PROCESS_VAR;
+  // clang-format on 
+  auto f = [&](const Eigen::VectorXd & x) -> Eigen::VectorXd {
+    Eigen::VectorXd x_prior = A_ * x;
+    x_prior[0] = tools::limit_rad(x_prior[0]);
+    x_prior[2] = tools::limit_rad(x_prior[2]);
+    x_prior[4] = tools::limit_rad(x_prior[4]);
+    x_prior[5] = tools::limit_rad(x_prior[5]);
+    return x_prior;
+  };
+  ekf_.predict(A_, Q_, f);
+}
+
+void SmallTarget::init(double nowtime, const PowerRune & p)
+{
+  // 初始化内部变量
+  lasttime_ = nowtime;
+
+  // 初始状态协方差矩阵
+  x0_.resize(7);
+  P0_.resize(7, 7);
+  A_.resize(7, 7);
+  Q_.resize(7, 7);
+  H_.resize(7, 7);//z x
+  R_.resize(7, 7);//z z
+  // [R_yaw]
+  // [v_R_yaw]
+  // [R_pitch]
+  // [R_dis]
+  // [yaw]
+  // [angle/row]
+  // [spd]   w=CV_PI/6
+
+  // clang-format off
+  // 初始状态
+  // spd 初值: 有足够的 roll 观测历史时用差分直接估计, 否则退回 SMALL_W。
+  // 旧值恒为 SMALL_W(60 deg/s) — 录像真实 ~120 deg/s, EKF 要爬几十帧才收敛,
+  // 期间绿框滞后、蓝框超前量逐帧膨胀(识别瞬间冲出的直接来源)。差分初值
+  // 让两级更新从第一帧就贴近真值。回绕用 limit_rad 处理, 整叶位 72° 跳变
+  // 用最近邻圈数对齐。
+  double spd_init = SMALL_W * voter.clockwise();
+  if (roll_history_.size() >= 2) {
+    const auto & newest = roll_history_.back();
+    const auto & oldest = roll_history_.front();
+    double d_roll = 0.0;
+    // 找与最新观测同叶位(72° 倍数)对齐后的角度差, 再 limit_rad 去回绕
+    double best_err = std::numeric_limits<double>::max();
+    for (int k = -5; k <= 5; k++) {
+      const double cand = oldest.second + k * 2.0 * CV_PI / 5.0;
+      const double err = std::fabs(tools::limit_rad(newest.second - cand));
+      if (err < best_err) {
+        best_err = err;
+        d_roll = tools::limit_rad(newest.second - cand);
+      }
+    }
+    const double dt_hist = newest.first - oldest.first;
+    // 时间有效性: 历史太旧(丢失前残留)不用于差分, 退默认。0.5s 内视为有效。
+    const double dt_stale = nowtime - newest.first;
+    if (dt_hist > 1e-3 && dt_hist < 0.5 && dt_stale >= 0 && dt_stale < 0.5) {
+      const double spd_diff = d_roll / dt_hist;
+      // 只接受量级合理的差分(0.5~4 rad/s ≈ 29~229 deg/s), 荒谬值(断帧/换叶残余)退回默认
+      if (std::fabs(spd_diff) > 0.5 && std::fabs(spd_diff) < 4.0) spd_init = spd_diff;
+    }
+  }
+  x0_ << p.ypd_in_world[0], 0.0, p.ypd_in_world[1], p.ypd_in_world[2],
+         p.ypr_in_world[0], p.ypr_in_world[2], 
+         spd_init;
+  // 初始状态协方差矩阵
+  P0_ << 10.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+          0.0, 10.0,  0.0,  0.0,  0.0,  0.0,  0.0,
+          0.0,  0.0, 10.0,  0.0,  0.0,  0.0,  0.0,
+          0.0,  0.0,  0.0, 10.0,  0.0,  0.0,  0.0,
+          0.0,  0.0,  0.0,  0.0, 10.0,  0.0,  0.0,
+          0.0,  0.0,  0.0,  0.0,  0.0, 10.0,  0.0,
+          0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  1e-2;
+  // 状态转移矩阵
+  // A_ 
+  // 过程噪声协方差矩阵                            //// 调整
+  // Q_ 
+  // 测量方程矩阵
+  // H_
+  // 测量噪声协方差矩阵                            //// 调整
+  // R_
+
+  // clang-format on
+
+  // 防止夹角求和出现异常值
+  auto x_add = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
+    Eigen::VectorXd c = a + b;
+    c[0] = tools::limit_rad(c[0]);
+    c[2] = tools::limit_rad(c[2]);
+    c[4] = tools::limit_rad(c[4]);
+    c[5] = tools::limit_rad(c[5]);
+    return c;
+  };
+  // 创建扩展卡尔曼滤波器对象
+  ekf_ = tools::ExtendedKalmanFilter(x0_, P0_, x_add);
+}
+
+void SmallTarget::update(double nowtime, const PowerRune & p)
+{
+  // [R_yaw]     angle0
+  // [v_R_yaw]
+  // [R_pitch]   angle2
+  // [R_dis]
+  // [yaw]       angle4
+  // [angle/row] angle5
+  // [spd]   w=CV_PI/6
+  const Eigen::VectorXd & R_ypd = p.ypd_in_world;  // R
+  const Eigen::VectorXd & ypr = p.ypr_in_world;
+  const Eigen::VectorXd & B_ypd = p.blade_ypd_in_world;  // center of blade
+
+  // spd 初值估计: 记录 roll 观测历史 (init 里差分用, 回绕在差分时处理)。
+  roll_history_.emplace_back(nowtime, ypr[2]);
+  if (roll_history_.size() > 8) roll_history_.pop_front();
+
+  // 处理扇叶跳变 angle/row
+  // 【切板防污染】击中切板时 roll 观测跳 72°(换了一片叶), 这是叶位跳变, 不是转速信息。
+  // EKF 的 P 里 roll-spd 有互协方差(predict 的 roll += dt*spd 每帧演化出耦合),
+  // 大残差会经 K[6] 冲击 spd → 蓝框(超前角 = spd×T)在切板瞬间加速。
+  // 对齐时同步切断 P[5][6]/P[6][5] 并放宽 P[5][5]: 叶位跳变不携带转速信息,
+  // 转速只由后续正常帧的连续观测决定。
+  bool blade_jump_aligned = false;
+  if (abs(ypr[2] - ekf_.x[5]) > CV_PI / 12) {
+    for (int i = -5; i <= 5; i++) {
+      double angle_c = ekf_.x[5] + i * 2 * CV_PI / 5;
+      if (std::fabs(angle_c - ypr[2]) < CV_PI / 5) {
+        ekf_.x[5] += i * 2 * CV_PI / 5;
+        blade_jump_aligned = true;
+        break;
+      }
+    }
+  }
+  if (blade_jump_aligned) {
+    // P[5][5] 放宽回初值量级(roll 位置刚跳过, 不确定度重置);
+    // 互协方差清零(切断 roll 残差 → spd 的增益通道)。
+    if (ekf_.P.size() > 0) {
+      ekf_.P(5, 5) = 10.0;
+      ekf_.P(5, 6) = 0.0;
+      ekf_.P(6, 5) = 0.0;
+    }
+  }
+
+  // vote判断是顺时针还是逆时针旋转
+  voter.vote(ekf_.x[5], ypr[2]);
+  if (voter.clockwise() * ekf_.x[6] < 0) ekf_.x[6] *= -1;  // spd
+
+  // 预测下一个状态
+  predict(nowtime - lasttime_);
+
+  // [R_yaw]     angle0
+  // [R_pitch]   angle1
+  // [R_dis]
+  // [angle/row] angle3
+  // [B_yaw]     angle4
+  // [B_pitch]   angle5
+  // [B_dis]
+
+  /// 1.
+
+  // [R_yaw]     angle0
+  // [R_pitch]   angle1
+  // [R_dis]
+  // [angle/row] angle3
+
+  // clang-format off
+  Eigen::MatrixXd H1{
+    {1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}, // R_yaw
+    {0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0}, // R_pitch
+    {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0}, // R_dis
+    {0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0}  // roll
+  };
+
+  // R1 是**方差**, 不是标准差。原先两个角度项都是 0.01 rad² → σ = 0.1 rad = 5.73°,
+  // 即"转轴方向只准到 ±5.73°"。在 9.45 m 处这是 ±0.94 m, 按 fx=2367 折算 **±236 px**。
+  //
+  // 实测(800 帧, --fps=25): PnP 位姿把 (0,0,0) 投回来离检测到的 R 十字 median 3.0 px
+  // = 0.073°。也就是说这个观测的实际精度比 R1 声称的**紧 79 倍**(方差差 6200 倍)。
+  // 后果不是"滤波器出错", 而是滤波器在合法使用被给予的余量: 同一轮实测 EKF 状态
+  // 投出来的转轴离 R 十字 median 134 px = 3.24°, 稳稳落在它以为的 ±5.73° 里。
+  // 画面上就是绿/蓝两条线的转轴端离洋红十字一大截。
+  //
+  // 改成 σ = 5e-3 rad = 0.29° = 11.8 px → 方差 2.5e-5。刻意仍比实测残差松 4 倍:
+  //   - 3.0 px 是 R 标进了点集之后的**样本内**残差, 不是独立精度;
+  //   - OBJECT_POINTS 与实物尚有不一致(本轮 PnP RMS 从 0.17 升到 4.2 px, 见下面 R2 注释),
+  //     这份几何误差也得有地方吸收。
+  //
+  // 【为什么不同时把 R2(叶心观测)的角度项一起收紧】不是漏了, 是故意的:
+  // 阶段 1 的模型是 H1 那几行单位阵, 精确; 阶段 2 的 h2() 走 point_buff2world(),
+  // 那里 pitch 被写死成 0, 而 PnP 解出的符面 pitch 未必为 0 —— 模型有结构性误差。
+  // 模型误差在放不进状态时就该放进 R。两级同样紧只会让它们互相拉扯中心位置,
+  // 而转轴的直接观测在阶段 1, 阶段 2 是经 700 mm 杠杆推出来的, 本就该让阶段 1 说话。
+  Eigen::MatrixXd R1{
+    {2.5e-5,    0.0, 0.0,  0.0}, // R_yaw   σ=0.29°(实测 0.073°)
+    {   0.0, 2.5e-5, 0.0,  0.0}, // R_pitch σ=0.29°
+    {   0.0,    0.0, 0.5,  0.0}, // R_dis   σ=0.71 m(实测 PnP std 0.40 m, 量级相符, 未动)
+    {   0.0,    0.0, 0.0,  0.1}  // roll    σ=18°(未动: roll 归 spd 链路, 不在本次变量内)
+  };
+  // clang-format on
+
+  // 防止夹角求差出现异常值
+  auto z_subtract1 = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
+    Eigen::VectorXd c = a - b;  //4 1
+    c[0] = tools::limit_rad(c[0]);
+    c[1] = tools::limit_rad(c[1]);
+    c[3] = tools::limit_rad(c[3]);
+    return c;
+  };
+
+  Eigen::VectorXd z1{{R_ypd[0], R_ypd[1], R_ypd[2], ypr[2]}};  // R_ypd roll
+
+  ekf_.update(z1, H1, R1, z_subtract1);
+
+  ///2.
+
+  // [B_yaw]     angle4
+  // [B_pitch]   angle5
+  // [B_dis]
+
+  // diag_skip_stage2 默认 false, 即下面这一整级照原样执行 —— 生产行为逐位不变。
+  // 置 true 只发生在 tests/auto_buff_test.cpp 传了 --no-stage2 时, 目的是把
+  // "阶段 2 每帧把中心推歪" 和 "init 残留被零 Q_ 锁死" 这两种机理分开量。
+  // 判据与副作用见那边 --no-stage2 那段注释。
+  if (!diag_skip_stage2) {
+    // clang-format off
+    Eigen::MatrixXd H2 = h_jacobian();  // 3*7
+
+    Eigen::MatrixXd R2{
+      {0.01, 0.0, 0.0}, // B_yaw
+      {0.0, 0.01, 0.0}, // B_pitch
+      {0.0,  0.0, 0.5}  // B_dis
+    };
+    // clang-format on
+
+    // 定义非线性转换函数h: x -> z
+    auto h2 = [&](const Eigen::VectorXd & x) -> Eigen::Vector3d {
+      Eigen::VectorXd R_ypd{{x[0], x[2], x[3]}};
+      Eigen::VectorXd R_xyz = tools::ypd2xyz(R_ypd);
+      Eigen::VectorXd R_xyz_and_yr{{R_ypd[0], R_ypd[1], R_ypd[2], x[4], x[5]}};
+      Eigen::VectorXd B_xyz = point_buff2world(Eigen::Vector3d(0.0, 0.0, 0.7));
+      Eigen::VectorXd B_ypd = tools::xyz2ypd(B_xyz);
+      return B_ypd;
+    };
+
+    // 防止夹角求差出现异常值
+    auto z_subtract2 = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
+      Eigen::VectorXd c = a - b;  //6 1
+      c[0] = tools::limit_rad(c[0]);
+      c[1] = tools::limit_rad(c[1]);
+      return c;
+    };
+
+    Eigen::VectorXd z2{{B_ypd[0], B_ypd[1], B_ypd[2]}};
+
+    ekf_.update(z2, H2, R2, h2, z_subtract2);
+  }
+
+  // ================= R 标硬锁定: 转轴是全局定点, 不滤波 =================
+  //
+  // 【用户判据】绿/蓝框基准外延的那条线必须锁死在 R 标转轴上。R 标是全局定点,
+  // 检测稳定位置固定 —— 它没有动力学过程需要滤波。实测两级更新后 EKF 的转轴状态
+  // 偏离锚定观测 median 39 px, 且 v_R_yaw 被估出 max 61.7 deg/s 的"转轴角速度"
+  // (转轴根本不动, 这是第二级叶心观测经 700mm 杠杆反灌进来的伪速度), 0.42s 的
+  // predict 前推把它放大成上千像素的蓝线漂移。修法: 不再让 EKF 估计转轴,
+  // 两级更新跑完后直接钳回锚定观测, v_R_yaw 恒 0。
+  //
+  // 【为什么可以整段钳掉】转轴状态 (R_yaw, v_R_yaw, R_pitch, R_dis) 的物理真值是
+  // 常量(定点), EKF 对常量的最优估计就是观测本身 —— 而观测已被 R 像素锚定到
+  // 1~3 px 精度(白线 median 3.0 px)。EKF 在这里没有增益, 只有被第二级拉扯的风险。
+  //
+  // 【为什么保留两级更新的形式】roll/spd/yaw(叶面自转)仍由两级更新估计, 只把转轴
+  // 4 维从滤波范围里摘出来。--no-stage2 对照、P 对角仪表照常工作。
+  {
+    const auto & R_obs = p.ypd_in_world;
+    ekf_.x[0] = R_obs[0];  // R_yaw
+    ekf_.x[1] = 0.0;       // v_R_yaw —— 转轴不动, 没有角速度
+    ekf_.x[2] = R_obs[1];  // R_pitch
+    ekf_.x[3] = R_obs[2];  // R_dis
+  }
+  // 更新lasttime
+  lasttime_ = nowtime;
+  return;
+}
+
+Eigen::MatrixXd SmallTarget::h_jacobian() const
+{
+  /// Z(3,1) = H3(3,3) * H2(3,5) * H1(5,5) * H0(5,7) * x(7,1)
+
+  // clang-format off
+  Eigen::MatrixXd H0{
+    {1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+    {0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0},
+    {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0},
+    {0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0},
+    {0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0}
+  };// 5*7
+
+  Eigen::VectorXd R_ypd{{ekf_.x[0], ekf_.x[2], ekf_.x[3]}};
+  Eigen::MatrixXd H_ypd2xyz = tools::ypd2xyz_jacobian(R_ypd);  // 3*3
+  Eigen::MatrixXd H1{
+    {H_ypd2xyz(0, 0), H_ypd2xyz(0, 1), H_ypd2xyz(0, 2), 0.0, 0.0},
+    {H_ypd2xyz(1, 0), H_ypd2xyz(1, 1), H_ypd2xyz(1, 2), 0.0, 0.0},
+    {H_ypd2xyz(2, 0), H_ypd2xyz(2, 1), H_ypd2xyz(2, 2), 0.0, 0.0},
+    {            0.0,             0.0,             0.0, 1.0, 0.0},
+    {            0.0,             0.0,             0.0, 0.0, 1.0}
+  };// 5*5
+
+  // double pitch = 0;
+  double yaw = ekf_.x[4];
+  double roll = ekf_.x[5];
+  double cos_yaw = cos(yaw);
+  double sin_yaw = sin(yaw);
+  double cos_roll = cos(roll);
+  double sin_roll = sin(roll);
+  Eigen::MatrixXd H2{
+    {1.0, 0.0, 0.0, 0.7 * cos_yaw * sin_roll,  0.7 * sin_yaw * cos_roll},
+    {0.0, 1.0, 0.0, 0.7 * sin_yaw * sin_roll, -0.7 * cos_yaw * cos_roll},
+    {0.0, 0.0, 1.0,                      0.0,           -0.7 * sin_roll}
+  };// 3*5
+
+  Eigen::VectorXd B_xyz = point_buff2world(Eigen::Vector3d(0.0, 0.0, 0.7));
+  Eigen::MatrixXd H3 = tools::xyz2ypd_jacobian(B_xyz);// 3*3
+  // clang-format on
+
+  return H3 * H2 * H1 * H0;  // 3*7
+
+  // auto h2 = [&](const Eigen::VectorXd & x) -> Eigen::Vector3d {
+  //   Eigen::VectorXd R_ypd{{x[0], x[2], x[3]}};
+  //   Eigen::VectorXd R_xyz = tools::ypd2xyz(R_ypd);
+  //   Eigen::VectorXd R_xyz_and_yr{{R_ypd[0], R_ypd[1], R_ypd[2], x[4], x[5]}};
+  //   Eigen::VectorXd B_xyz = point_buff2world(Eigen::Vector3d(0.0, 0.0, 0.7));
+  //   Eigen::VectorXd B_ypd = tools::xyz2ypd(B_xyz);
+  //   return B_ypd;
+  // };
+}
+
+/// BigTarget
+
+/// BigTarget
+
+// =====================================================================
+// BigTarget(大符) — 2026-09-13 重写
+//
+// 与 SmallTarget 的关键差异(规则.md):
+//   spd = a·sin(ωt) + (2.090 − a),  a∈[0.780,1.045], ω∈[1.884,2.000]
+//   → 转速周期摆动 0 ~ 2.09 rad/s, 周期 2π/ω ∈ [3.14,3.34] s; 方向恒正。
+//   激活会话边界 a/ω/φ 随机重置, 但转子相位连续、转轴不动。
+//
+// 架构定案(2026-09-13-大符整体方案设计.md §4.4):
+//   1. 单一模型 = 10 态 EKF。原实现 predict() 里 roll 积分用 RANSAC 拟合的
+//      fit_spd_、雅可比又用 EKF 自己的 a/ω/φ —— 两套 spd 模型同时生效互相拉扯,
+//      且从未被任何录像验证过。RansacSineFitter 降级为只读仪表: 只喂 EKF 估计值、
+//      拟合结果只写 spd 供离线对比, 不再回流 predict。
+//   2. 会话边界/参数重置检测: 只重置 spd/a/ω/φ 子块, R 系 4 态与 yaw/roll 相位
+//      保留 —— 规则保证参数重置时转子不跳位, 转轴锚定成果也不该被丢掉。
+//   3. 发散门从"全量 first_in_ 重置"改为"参数子块重置"。原门 ×1.5 宽松度无依据,
+//      触发即丢掉全部状态(包括 R 锚定), 是大符下的明确错误。
+//
+// 该段只服务 --target=big; SmallTarget 路径(小符生产行为)零改动。
+// =====================================================================
+
+BigTarget::BigTarget() : Target(), spd_fitter_(100, 0.5, 1.884, 2.000) {}
+
+void BigTarget::get_target(
+  const std::optional<PowerRune> & p, std::chrono::steady_clock::time_point & timestamp)
+{
+  if (!p.has_value()) {
+    // ---- 第十八轮方案六: 丢失帧 keep-alive ----
+    // 旧实现无观测帧直接 unsolvable_=true → 绿框(EKF 状态重投影)整帧消失,
+    // 即"绿框屏闪"。EKF 本身有 predict 能力, 短空窗内完全可以继续输出:
+    // 只需把状态按时间推进, 不做观测更新。窗口边界取 5 帧/0.3s(同时满足,
+    // 帧数覆盖检测抖动, 秒数防 25fps 慢流), 期间 unsolvable_ 保持 false;
+    // 超窗才真正 unsolve(绿框淡出)并交给下方的重初始化门处理。
+    // 注意联动: keep-alive 帧数(5) 必须小于重初始化阈值(lost_cn_>6),
+    // 否则 EKF 在 keep-alive 结束与重初始化之间出现无定义窗口。
+    lost_cn_++;
+    if (!first_in_ && lost_cn_ <= 5 && lasttime_tp_set_ &&
+        tools::delta_time(timestamp, lasttime_tp_) < 0.3) {
+      predict(tools::delta_time(timestamp, lasttime_tp_));
+      lasttime_tp_ = timestamp;
+    } else {
+      unsolvable_ = true;
+    }
+    return;
+  }
+
+  auto time_gap = tools::delta_time(timestamp, start_timestamp_);
+
+  if (first_in_) {
+    unsolvable_ = true;
+    start_timestamp_ = timestamp;
+    time_gap = 0.0;
+    init(time_gap, p.value());
+    first_in_ = false;
+  }
+
+  // 丢失过久才整体重初始化。阈值 6 帧 = 25fps 下 0.24s, 与 SmallTarget 一致。
+  if (lost_cn_ > 6) {
+    unsolvable_ = true;
+    tools::logger()->debug("[Target] 丢失buff");
+    lost_cn_ = 0;
+    first_in_ = true;
+    return;
+  }
+  lost_cn_ = 0;
+  now_tp_ = timestamp;  // 透传给 update(), 供 keep-alive 基准时间戳记录
+
+  unsolvable_ = false;
+  update(time_gap, p.value());
+
+  // ---- 发散门: 规则包络, 越界只重置转速参数子块, 不丢 R 锚定与转子相位 ----
+  // a/ω 允许 20% 宽容(实测转速与目标函数本身有 500ms 时延, 拟合值可能瞬时越界);
+  // 只有持续越界才说明会话参数真的重置了。
+  constexpr double A_MIN = 0.780, A_MAX = 1.045, W_MIN = 1.884, W_MAX = 2.000;
+  constexpr double TOL = 0.20;
+  if (
+    ekf_.x[7] < A_MIN * (1 - TOL) || ekf_.x[7] > A_MAX * (1 + TOL) ||
+    ekf_.x[8] < W_MIN * (1 - TOL) || ekf_.x[8] > W_MAX * (1 + TOL)) {
+    params_diverge_count_++;
+    if (params_diverge_count_ >= 5) {
+      tools::logger()->debug(
+        "[Target] 大符参数发散(a={:.2f} w={:.2f}), 重置参数子块", ekf_.x[7], ekf_.x[8]);
+      reset_sine_params();
+      params_diverge_count_ = 0;
+    }
+  } else {
+    params_diverge_count_ = 0;
+  }
+}
+
+// 只重置正弦参数子块: spd/a/ω/φ 的状态回中点、P 子块放宽、与其它状态的互协方差切断。
+// R 系(x[0..3])、yaw(x[4])、roll(x[5]) 原样保留 —— 规则保证会话边界转子相位连续。
+void BigTarget::reset_sine_params()
+{
+  const double a_mid = 0.9125, w_mid = 1.942;
+  ekf_.x[6] = a_mid * 0.0 + (2.090 - a_mid);  // spd 初值 = b = 2.09 - a 中点
+  ekf_.x[7] = a_mid;
+  ekf_.x[8] = w_mid;
+  ekf_.x[9] = 0.0;
+  if (ekf_.P.size() == 0) return;
+  for (int r = 6; r <= 9; r++) {
+    for (int c = 0; c < 10; c++) ekf_.P(r, c) = 0.0;
+    for (int rr = 0; rr < 10; rr++) ekf_.P(rr, r) = 0.0;
+  }
+  ekf_.P(6, 6) = 1.0;    // spd: σ=1 rad/s
+  ekf_.P(7, 7) = 0.05;   // a:   σ≈0.22 rad/s
+  ekf_.P(8, 8) = 0.01;   // ω:   σ≈0.1 rad/s
+  ekf_.P(9, 9) = 6.25;   // φ:   σ=2.5 rad (相位未知, 大方差)
+}
+
+// spd 闭式(t0 时刻状态下的转速)。x[9]=φ 是相位残差, 见 init() 注释。
+double BigTarget::spd_at(const Eigen::VectorXd & x, double t) const
+{
+  return x[7] * std::sin(x[8] * t + x[9]) + (2.090 - x[7]);
+}
+
+// roll 闭式积分: roll(t) = roll(t0) + sgn·[ a/ω·(cos(ωt0+φ) − cos(ωt+φ)) + b·(t−t0) ]
+// 与状态定义严格一致(x[5]=roll 在 t0 时刻的值), predict 里 f 也用这同一式。
+double BigTarget::roll_at(const Eigen::VectorXd & x, double t0, double t) const
+{
+  const double sgn = dir_locked_ ? dir_sign_ : voter.clockwise();
+  const double a = x[7], w = x[8], fi = x[9], b = 2.090 - a;
+  return x[5] +
+         sgn * (a / w * (std::cos(w * t0 + fi) - std::cos(w * t + fi)) + b * (t - t0));
+}
+
+// t0/t2 两时刻 roll 闭式差的解析雅可比(对 x[5],x[7],x[8],x[9] 四个非零项)。
+Eigen::MatrixXd BigTarget::roll_diff_jacobian(
+  const Eigen::VectorXd & x, double t0, double t2) const
+{
+  Eigen::MatrixXd J = Eigen::MatrixXd::Zero(1, 10);
+  const double sgn = dir_locked_ ? dir_sign_ : voter.clockwise();
+  const double a = x[7], w = x[8], fi = x[9], b = 2.090 - a;
+  const double c0 = std::cos(w * t0 + fi), c2 = std::cos(w * t2 + fi);
+  const double s0 = std::sin(w * t0 + fi), s2 = std::sin(w * t2 + fi);
+  J(0, 5) = 1.0;
+  // ∂/∂a: sgn·[ (1/w)(c0 − c2) + (t2 − t0)·(cos(ωt2+φ) − cos(ωt0+φ)) ]
+  //      = sgn·[ (c0−c2)/w − (t2−t0)·(c0−c2) ]  (因 ∂b/∂a = −1)
+  J(0, 7) = sgn * ((c0 - c2) / w - (t2 - t0) * (c0 - c2));
+  // ∂/∂ω: sgn·a·[ −(t2·s2 − t0·s0)/w + (c0 − c2)/w² ]
+  J(0, 8) = sgn * a * (-(t2 * s2 - t0 * s0) / w + (c0 - c2) / (w * w));
+  // ∂/∂φ: sgn·(a/w)·(s2 − s0)
+  J(0, 9) = sgn * (a / w) * (s2 - s0);
+  (void)b;
+  return J;
+}
+
+// 预测时长锁存器: aim()/mpc_aim() 调 target.predict(dt) 前进状态后无法把 dt 传进
+// 更新级, 而闭式转移需要 t0。锁存最近一次 predict 的 dt, update() 用它反推 t0。
+void BigTarget::latch_predict_dt(double dt) { last_predict_dt_ = dt; }
+
+void BigTarget::predict(double dt)
+{
+  latch_predict_dt(dt);
+  const double t1 = phase_t0_;  // 状态当前有效时刻(可能已被 aim 的前瞻 predict 推进)
+  const double t2 = t1 + dt;
+  Eigen::MatrixXd A = Eigen::MatrixXd::Identity(10, 10);
+  A.block<1, 4>(5, 5) = roll_diff_jacobian(ekf_.x, t1, t2).block<1, 4>(0, 5);
+
+  // ---- 过程噪声 ----
+  // 与 SmallTarget 的差异: 大符 spd 峰峰 ~2 rad/s、周期 ~3.2s, 必须跟得上
+  // d(spd)/dt ~ a·ω ≈ 2 rad/s² 的变化率; 参数通道(a/ω/φ)在收敛前要允许大步移动。
+  // 数值为初值, 待合成数据/录像验证后收紧 —— 仪表先行, 不拍脑袋定案。
+  Eigen::MatrixXd Q = Eigen::MatrixXd::Zero(10, 10);
+  const double v1 = 0.01;  // 转轴缓变角加速度方差
+  Q(0, 0) = v1 * std::pow(dt, 4) / 4.0;
+  Q(0, 1) = Q(1, 0) = v1 * std::pow(dt, 3) / 2.0;
+  Q(1, 1) = v1 * dt * dt;
+  Q(5, 5) = 0.09;          // roll: 关键点噪声主导
+  Q(6, 6) = 0.05;          // spd: 允许跟随 a·ω 量级变化
+  Q(7, 7) = 0.002;         // a
+  Q(8, 8) = 0.0005;        // ω
+  Q(9, 9) = 0.05;          // φ
+
+  auto f = [&](const Eigen::VectorXd & x) -> Eigen::VectorXd {
+    Eigen::VectorXd xp = x;
+    xp[0] = tools::limit_rad(x[0] + dt * x[1]);
+    xp[2] = tools::limit_rad(x[2]);
+    xp[4] = tools::limit_rad(x[4]);
+    xp[5] = tools::limit_rad(roll_at(x, t1, t2));
+    xp[6] = spd_at(x, t2);
+    return xp;
+  };
+  ekf_.predict(A, Q, f);
+  phase_t0_ = t2;
+}
+
+void BigTarget::init(double nowtime, const PowerRune & p)
+{
+  lasttime_ = nowtime;
+  phase_t0_ = nowtime;
+  unsolvable_ = true;
+
+  x0_.resize(10);
+  P0_.resize(10, 10);
+  A_.resize(10, 10);
+  Q_.resize(10, 10);
+  H_.resize(7, 10);
+  R_.resize(7, 7);
+
+  // [R_yaw]      0: 转轴方位(锚定, 见 update 尾部硬锁定)
+  // [v_R_yaw]    1: 恒 0
+  // [R_pitch]    2
+  // [R_dis]      3
+  // [yaw]        4: 叶面法向偏航
+  // [roll]       5: 转子相位(t0 时刻)
+  // [spd]        6: a·sin(ωt)+b
+  // [a]          7: 规则 [0.780,1.045]
+  // [w]          8: 规则 [1.884,2.000]
+  // [fi]         9: 相位。t0=init 时刻, 而规则 t 从会话开始计 —— φ 在这里
+  //                 吸收两者之差(含实物 500ms 时延), 取值任意实数不回绕。
+
+  // 参数初值 = 规则范围中点; P 给大方差让数据自己收敛。
+  const double a0 = 0.9125, w0 = 1.942, b0 = 2.090 - a0;
+  // 第七轮: roll/x[5] 初值改用几何相位 p.blade_phase(见 buff_solver.cpp),
+  // 不再用 ypr_in_world[2] —— 欧拉分解在 IPPE 翻转时会把 yaw/pitch 跳变泄漏进 roll。
+  x0_ << p.ypd_in_world[0], 0.0, p.ypd_in_world[1], p.ypd_in_world[2],
+         p.ypr_in_world[0], p.blade_phase, b0, a0, w0, 0.0;
+
+  P0_ = Eigen::MatrixXd::Identity(10, 10) * 10.0;
+  P0_(0, 0) = P0_(2, 2) = P0_(3, 3) = P0_(4, 4) = P0_(5, 5) = 10.0;
+  P0_(6, 6) = 1.0;    // spd:  σ=1 rad/s
+  P0_(7, 7) = 0.05;   // a
+  P0_(8, 8) = 0.01;   // ω
+  P0_(9, 9) = 6.25;   // φ:   σ=2.5 rad
+
+  auto x_add = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
+    Eigen::VectorXd c = a + b;
+    c[0] = tools::limit_rad(c[0]);
+    c[2] = tools::limit_rad(c[2]);
+    c[4] = tools::limit_rad(c[4]);
+    c[5] = tools::limit_rad(c[5]);
+    return c;
+  };
+  ekf_ = tools::ExtendedKalmanFilter(x0_, P0_, x_add);
+  params_diverge_count_ = 0;
+  jump_hist_.clear();
+  // 第十八轮: R 锚定为会话级状态, 整体重初始化(=新会话)时清零重收敛。
+  r_anchor_count_ = 0;
+  r_anchor_[0] = r_anchor_[1] = r_anchor_[2] = 0.0;
+  spd_fitter_ = tools::RansacSineFitter(100, 0.5, 1.884, 2.000);
+}
+
+void BigTarget::update(double nowtime, const PowerRune & p)
+{
+  last_update_tp_ = now_tp_;
+  // t0: 上一观测时刻(= lasttime_); 若中间做过 predict(链路总是先 update 后 predict,
+  // aim 再额外 predict), 闭式转移的基准时刻就是它。predict 已把状态推进到
+  // t0 + last_predict_dt_, 这里先把 t0 求出来, 所有闭式量都在 t0 基准上定义。
+  const double t0 = phase_t0_;  // 状态当前有效时刻(aim 前瞻 predict 已推进过)
+  const Eigen::VectorXd & R_ypd = p.ypd_in_world;
+  const Eigen::VectorXd & B_ypd = p.blade_ypd_in_world;
+  // 第七轮: roll 观测统一改用几何相位。理由见 buff_solver.cpp 几何相位注释:
+  // ypr[2] 在 IPPE 双解翻转时被 yaw/pitch 跳变污染, 是隔帧 -132~-312 deg/s 假转速的来源。
+  const double blade_phase = p.blade_phase;
+
+  // ---- 扇叶跳变对齐(继承 SmallTarget 切板防污染, 死区一并消除) ----
+  // 观测叶心角与当前 roll 差超过 72°/2 才需要找槽位; 找不到最近槽位才跳过本帧。
+  // 原 15°~36° 死区(循环选 i=0 什么都不做)在此消除: i 从 0 起自然覆盖。
+  bool blade_jump_aligned = false;
+  if (std::abs(tools::limit_rad(blade_phase - ekf_.x[5])) > CV_PI / 12) {
+    double best_err = std::numeric_limits<double>::max();
+    int best_i = 0;
+    for (int i = -5; i <= 5; i++) {
+      const double angle_c = ekf_.x[5] + i * 2 * CV_PI / 5;
+      const double err = std::fabs(angle_c - blade_phase);
+      if (err < best_err) {
+        best_err = err;
+        best_i = i;
+      }
+    }
+    if (best_err < CV_PI / 5) {
+      ekf_.x[5] += best_i * 2 * CV_PI / 5;
+      blade_jump_aligned = true;
+    }
+  }
+  if (blade_jump_aligned && ekf_.P.size() > 0) {
+    // P[5][5] 放宽、与 spd/a/ω/φ 的互协方差切断: 叶位跳变不携带转速信息。
+    ekf_.P(5, 5) = 10.0;
+    for (int c = 6; c <= 9; c++) {
+      ekf_.P(5, c) = 0.0;
+      ekf_.P(c, 5) = 0.0;
+    }
+    // 第二十四轮方案C: 跳变后相位观测收紧窗口(约0.4s@97fps)。
+    // P[5][5] 已放宽, 观测若仍宽松则状态要十几帧才咬回, 期间绿框持续滞后。
+    track_r1_tight_ = 40;
+  }
+
+  // ---- 跳变率检测(第七轮): 1s 窗口内跳变占比 > 30% 触发正弦参数子块重置 ----
+  // 物理跳变(叶片切换)在 2 rad/s 下约 0.6~0.7s 一次, 25~30fps 下占比 < 6%;
+  // 观测源连续跳变意味着相位观测被污染, 继续 Update 只会把 a/ω/φ 拉飞,
+  // 此时重置参数子块(R 系与转子相位保留)代价最小。
+  jump_hist_.emplace_back(nowtime, blade_jump_aligned);
+  while (!jump_hist_.empty() && nowtime - jump_hist_.front().first > 1.0) jump_hist_.pop_front();
+  int jump_cnt = 0;
+  for (const auto & [tm, j] : jump_hist_) {
+    (void)tm;
+    if (j) jump_cnt++;
+  }
+  if (jump_hist_.size() >= 10 && jump_cnt > 0.3 * static_cast<double>(jump_hist_.size())) {
+    tools::logger()->debug(
+      "[Target] 大符跳变率 {}/{} 超阈, 重置正弦参数子块", jump_cnt, jump_hist_.size());
+    reset_sine_params();
+    jump_hist_.clear();
+  }
+
+  // ---- QUICK FORENSIC LOG (temporary, big-buff green-box lag) ----
+  {
+    const double d_phase = tools::limit_rad(blade_phase - ekf_.x[5]);
+    tools::logger()->info(
+      "[BigTarget::update] t={:.3f} phase={:.1f} roll={:.1f} d={:.1f}deg thr=15.0 aligned={} jumpwin={}/{}",
+      nowtime, blade_phase * 57.3, ekf_.x[5] * 57.3, d_phase * 57.3,
+      blade_jump_aligned ? 1 : 0, jump_cnt, jump_hist_.size());
+  }
+  voter.vote(ekf_.x[5], blade_phase);
+  // ---- 第二十三轮: 转向锁存(相邻观测相位差投票, 回绕安全) ----
+  if (!dir_locked_) {
+    if (has_last_phase_obs_ && nowtime - last_phase_t_ > 1e-3) {
+      // 只用观测本身的运动方向: d = limit_rad(phase_now - phase_prev)
+      // ①不掺 EKF 状态残差, ②±180deg 回绕处符号正确。
+      // 切板会造成 ±72deg 槽位跳, 跳变帧 |d| > 36deg 直接弃票, 不污染净票。
+      const double d_obs = tools::limit_rad(blade_phase - last_phase_obs_);
+      if (std::abs(d_obs) < CV_PI / 5) {  // <36deg: 正常帧间推进/噪声
+        dir_votes_ += (d_obs > 0) ? 1 : -1;
+      }
+      if (std::abs(dir_votes_) >= 20) {
+        dir_sign_ = (dir_votes_ > 0) ? 1 : -1;
+        dir_locked_ = true;
+        tools::logger()->info(
+          "[BigTarget] 转向锁存: {} (净票 {}, t={:.2f}s)",
+          dir_sign_ > 0 ? "顺时针(+)" : "逆时针(-)", dir_votes_, nowtime);
+      }
+    }
+    last_phase_obs_ = blade_phase;
+    last_phase_t_ = nowtime;
+    has_last_phase_obs_ = true;
+  }
+
+  // ---- 预测到当前观测时刻 ----
+  // 若链路在两次 update 之间做过 predict(aim 的前瞻), ekf_.x 已在 t0+last_predict_dt_;
+  // 状态定义基准仍是 t0(roll=相位@t0), 观测更新前先做一步 dt=nowtime−t0 的 predict。
+  const double dt_meas = nowtime - phase_t0_;  // aim 前瞻后可能 phase_t0_ 已在未来
+  if (dt_meas > 1e-9) {  // 负值不倒退: aim 前瞻已越过观测时刻
+    Eigen::MatrixXd A = Eigen::MatrixXd::Identity(10, 10);
+    A.block<1, 4>(5, 5) = roll_diff_jacobian(ekf_.x, t0, nowtime).block<1, 4>(0, 5);
+    // 第二十四轮补充: Q=0 是 yaw 卡死根因。aim 前瞻 predict(Q>0) 作用于副本,
+    // 测试/无 aim 链路里真身只走这条 Q=0 路径, P(4,4) 几何塌缩 → K→0 →
+    // yaw 冻结在与观测差 10~14deg 的值上(日志实锤: top帧 yaw_diff 恒定且 d≈0)。
+    // 补按 dt 比例的过程噪声(与 predict() 的量级一致), 保持 EKF 可观性。
+    Eigen::MatrixXd Q = Eigen::MatrixXd::Zero(10, 10);
+    Q(4, 4) = 0.09 * dt_meas;  // yaw: 与 predict() 同量级(0.09/帧 → 按秒折算)
+    Q(5, 5) = 0.09;            // roll: 相位在两次观测间按闭式积分推进, 噪声来自参数误差
+    Q(6, 6) = 0.05;            // spd
+    Q(7, 7) = 0.002;           // a
+    Q(8, 8) = 0.0005;          // ω
+    Q(9, 9) = 0.05;            // φ
+    auto f = [&](const Eigen::VectorXd & x) -> Eigen::VectorXd {
+      Eigen::VectorXd xp = x;
+      xp[0] = tools::limit_rad(x[0] + dt_meas * x[1]);
+      xp[2] = tools::limit_rad(x[2]);
+      xp[4] = tools::limit_rad(x[4]);
+      xp[5] = tools::limit_rad(roll_at(x, t0, nowtime));
+      xp[6] = spd_at(x, nowtime);
+      return xp;
+    };
+    ekf_.predict(A, Q, f);
+    lasttime_ = nowtime;
+    phase_t0_ = nowtime;
+  }
+
+  ///1. 第一级: R 标 + roll
+  // 大符与 SmallTarget 的差别: roll 观测噪声按大符关键点实测定 0.1(rad²),
+  // 待录像仪表验证后再收紧(先量再改)。
+  // yaw(x[4]) 此前仅靠第二级叶心观测间接约束, 实测漂移 +5.89deg(med);
+  // 现将 PnP 直出的 yaw(p.ypr_in_world[0]) 加入第一级观测, 直接锚定 yaw 状态。
+  Eigen::MatrixXd H1 = Eigen::MatrixXd::Zero(5, 10);
+  H1(0, 0) = 1.0;
+  H1(1, 2) = 1.0;
+  H1(2, 3) = 1.0;
+  H1(3, 5) = 1.0;
+  H1(4, 4) = 1.0;  // yaw 观测: z1[4] = p.ypr_in_world[0]
+
+  // 方案C(第二十四轮): R1(3,3) 相位观测噪声在跳变对齐后 40 帧内收紧(0.1→0.02),
+  // 窗口外保持原值 —— 让 EKF 在锯齿爬升段快速咬住观测, 压掉 d 的 15deg 峰值。
+  const double r1_phase_noise = (track_r1_tight_ > 0) ? 0.02 : 0.1;
+  Eigen::MatrixXd R1{
+    {0.01, 0.0, 0.0, 0.0, 0.0},
+    {0.0, 0.01, 0.0, 0.0, 0.0},
+    {0.0, 0.0, 0.5, 0.0, 0.0},
+    {0.0, 0.0, 0.0, r1_phase_noise, 0.0},
+    {0.0, 0.0, 0.0, 0.0, 0.01}};  // yaw σ≈5.7deg
+
+  auto z_subtract1 = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
+    Eigen::VectorXd c = a - b;
+    c[0] = tools::limit_rad(c[0]);
+    c[1] = tools::limit_rad(c[1]);
+    c[3] = tools::limit_rad(c[3]);
+    c[4] = tools::limit_rad(c[4]);
+    return c;
+  };
+
+  Eigen::VectorXd z1{{R_ypd[0], R_ypd[1], R_ypd[2], blade_phase, p.ypr_in_world[0]}};
+  ekf_.update(z1, H1, R1, z_subtract1);
+
+  ///2. 第二级: 叶心观测(同小符两级结构)
+  Eigen::MatrixXd H2 = h_jacobian();
+  Eigen::MatrixXd R2{
+    {0.01, 0.0, 0.0},
+    {0.0, 0.01, 0.0},
+    {0.0, 0.0, 0.5}};
+
+  auto h2 = [&](const Eigen::VectorXd & x) -> Eigen::Vector3d {
+    Eigen::VectorXd R_ypd2{{x[0], x[2], x[3]}};
+    Eigen::VectorXd B_xyz = point_buff2world(Eigen::Vector3d(0.0, 0.0, 0.7));
+    Eigen::VectorXd B_ypd = tools::xyz2ypd(B_xyz);
+    (void)R_ypd2;
+    return B_ypd;
+  };
+
+  auto z_subtract2 = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
+    Eigen::VectorXd c = a - b;
+    c[0] = tools::limit_rad(c[0]);
+    c[1] = tools::limit_rad(c[1]);
+    return c;
+  };
+
+  Eigen::VectorXd z2{{B_ypd[0], B_ypd[1], B_ypd[2]}};
+  ekf_.update(z2, H2, R2, h2, z_subtract2);
+
+  // ---- ω 硬 clamp(第七轮): EKF 参数通道无观测直接约束, 收敛过程可能越过规则包络;
+  // 大符转速上限 2.09 rad/s 物理上不允许 ω 跑出 [1.884, 2.000]。发散门 ±20% 太宽
+  // (允许 ω 到 2.4), 越界值若被 predict 积分会放大相位误差, 这里直接夹回规则区间。
+  ekf_.x[8] = std::clamp(ekf_.x[8], 1.884, 2.000);
+
+  // ---- 第十八轮方案三: R 标长期锚定(EWMA) + 方案七: 离群拒收 ----
+  // 旧实现把 R_ypd 逐帧硬写进 x[0..3] —— R 在世界系里是静止点, 单帧 PnP
+  // 的 R 观测噪声(尤其单候选帧、反光帧)被逐帧原样吞进状态, 所以下游环带门/
+  // 偏下规则/绿框重投影的基准都在抖。改为:
+  //   1. 收敛前(锚定计数 < 5)沿用硬锁定快速建立初值;
+  //   2. 收敛后观测先过固定离群门(10deg/10deg/0.5m, 相对锚定值) —— 反光/
+  //      PnP 翻转残余造成的坏 R 观测整帧拒收, 不进 EWMA;
+  //   3. 通过者以 α=0.1 EWMA 融入锚定值 —— 等价于世界系静止点的多帧平滑。
+  // 锚定值随后写回 x[0..3](结构上与旧硬锁定同位, 但值是平滑过的)。
+  {
+    const bool r_anchor_ready = (r_anchor_count_ >= 5);
+    bool r_obs_ok = true;
+    if (r_anchor_ready) {
+      const double d_yaw = std::abs(tools::limit_rad(R_ypd[0] - r_anchor_[0]));
+      const double d_pitch = std::abs(tools::limit_rad(R_ypd[1] - r_anchor_[1]));
+      const double d_dis = std::abs(R_ypd[2] - r_anchor_[2]);
+      if (d_yaw > 10.0 / 57.3 || d_pitch > 10.0 / 57.3 || d_dis > 0.5) r_obs_ok = false;
+    }
+    if (r_obs_ok) {
+      constexpr double R_EWMA_ALPHA = 0.1;
+      if (r_anchor_count_ == 0) {
+        r_anchor_[0] = R_ypd[0];
+        r_anchor_[1] = R_ypd[1];
+        r_anchor_[2] = R_ypd[2];
+      } else {
+        r_anchor_[0] += R_EWMA_ALPHA * tools::limit_rad(R_ypd[0] - r_anchor_[0]);
+        r_anchor_[1] += R_EWMA_ALPHA * tools::limit_rad(R_ypd[1] - r_anchor_[1]);
+        r_anchor_[2] += R_EWMA_ALPHA * (R_ypd[2] - r_anchor_[2]);
+      }
+      r_anchor_count_++;
+      ekf_.x[0] = r_anchor_[0];
+      ekf_.x[1] = 0.0;
+      ekf_.x[2] = r_anchor_[1];
+      ekf_.x[3] = r_anchor_[2];
+    }
+    if (!r_obs_ok) {
+      tools::logger()->info(
+        "[BigTarget::update] R_OBS_REJECT t={:.3f} d_yaw={:.1f} d_pitch={:.1f} d_dis={:.3f} obs=({:.1f},{:.1f},{:.3f}) anchor=({:.1f},{:.1f},{:.3f})",
+        nowtime,
+        std::abs(tools::limit_rad(R_ypd[0] - r_anchor_[0])) * 57.3,
+        std::abs(tools::limit_rad(R_ypd[1] - r_anchor_[1])) * 57.3,
+        std::abs(R_ypd[2] - r_anchor_[2]),
+        R_ypd[0] * 57.3, R_ypd[1] * 57.3, R_ypd[2],
+        r_anchor_[0] * 57.3, r_anchor_[1] * 57.3, r_anchor_[2]);
+    }
+    // r_obs_ok=false: 保留上一帧锚定值(状态不动), 坏观测被拒。
+  }
+
+  // ---- RANSAC 只读仪表: 喂 EKF 估计的 spd, 拟合结果写 spd 供离线对比, 不回流 ----
+  // 收敛门(2026-09-13): a/ω/φ 未收敛期(P(7,7) > 0.01 → σa > 0.1 rad/s, 未稳定),
+  // 不喂 spd_fitter_。理由: 未收敛期 EKF 的 spd 估计跳变幅度可达 ~1 rad/s,
+  // 喂进去会让 RANSAC 把 a/ω/φ 拟合到瞬态而非稳态, 仪表结果无意义、
+  // 还可能掩盖其他真实问题。
+  const bool spd_in_range = (ekf_.x[6] < 2.1 && ekf_.x[6] >= 0);
+  const bool a_converged = ekf_.P.size() > 0 && ekf_.P(7, 7) < 0.01;
+  if (spd_in_range && a_converged) spd_fitter_.add_data(nowtime, ekf_.x[6]);
+  spd_fitter_.fit();
+  spd = spd_fitter_.sine_function(
+    nowtime, spd_fitter_.best_result_.A, spd_fitter_.best_result_.omega,
+    spd_fitter_.best_result_.phi, spd_fitter_.best_result_.C);
+  if (std::abs(spd) > 4) spd = 0;
+
+  // 方案C: 收紧窗口递减(每观测帧一次; R1 已在本帧用过后才递减,
+  // 保证置 40 后恰好有 40 个 update 帧吃到收紧的 R1)。
+  if (track_r1_tight_ > 0) track_r1_tight_--;
+  lasttime_ = nowtime;
+  phase_t0_ = nowtime;
+  // keep-alive 基准时间戳: lasttime_ 是"相对会话起始的秒数"(double),
+  // 而 keep-alive 需要 time_point 做 wall-clock 空窗判定, 两者不同源, 分开记。
+  lasttime_tp_ = last_update_tp_;
+  lasttime_tp_set_ = true;
+  unsolvable_ = false;
+}
+
+Eigen::MatrixXd BigTarget::h_jacobian() const
+{
+  Eigen::MatrixXd H0 = Eigen::MatrixXd::Zero(5, 10);
+  H0(0, 0) = 1.0;
+  H0(1, 2) = 1.0;
+  H0(2, 3) = 1.0;
+  H0(3, 4) = 1.0;
+  H0(4, 5) = 1.0;
+
+  Eigen::VectorXd R_ypd{{ekf_.x[0], ekf_.x[2], ekf_.x[3]}};
+  Eigen::MatrixXd H_ypd2xyz = tools::ypd2xyz_jacobian(R_ypd);
+  Eigen::MatrixXd H1 = Eigen::MatrixXd::Zero(5, 5);
+  H1.block<3, 3>(0, 0) = H_ypd2xyz;
+  H1(3, 3) = 1.0;
+  H1(4, 4) = 1.0;
+
+  const double yaw = ekf_.x[4], roll = ekf_.x[5];
+  const double cos_yaw = std::cos(yaw), sin_yaw = std::sin(yaw);
+  const double cos_roll = std::cos(roll), sin_roll = std::sin(roll);
+  Eigen::MatrixXd H2{
+    {1.0, 0.0, 0.0, 0.7 * cos_yaw * sin_roll, 0.7 * sin_yaw * cos_roll},
+    {0.0, 1.0, 0.0, 0.7 * sin_yaw * sin_roll, -0.7 * cos_yaw * cos_roll},
+    {0.0, 0.0, 1.0, 0.0, -0.7 * sin_roll}};
+
+  Eigen::VectorXd B_xyz = point_buff2world(Eigen::Vector3d(0.0, 0.0, 0.7));
+  Eigen::MatrixXd H3 = tools::xyz2ypd_jacobian(B_xyz);
+  return H3 * H2 * H1 * H0;
+}
+}  // namespace auto_buff

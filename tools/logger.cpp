@@ -19,7 +19,9 @@ void set_logger()
   file_sink->set_level(spdlog::level::debug);
 
   auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-  console_sink->set_level(spdlog::level::debug);
+  // 控制台只放 info 以上: debug 级是高频路径(丢失/发散/弹道失败), 刷屏会淹没
+  // 真正要看的仪表行。完整 debug 日志仍写入文件 sink, 诊断能力不受损。
+  console_sink->set_level(spdlog::level::info);
 
   logger_ = std::make_shared<spdlog::logger>("", spdlog::sinks_init_list{file_sink, console_sink});
   logger_->set_level(spdlog::level::debug);
